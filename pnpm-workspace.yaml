@@ -1,0 +1,9 @@
+packages:
+  - app
+
+# pnpm does not run dependency install scripts unless they are approved here.
+# esbuild unpacks its platform binary; @parcel/watcher and vue-demi are Nuxt deps.
+allowBuilds:
+  esbuild: true
+  "@parcel/watcher": true
+  vue-demi: true
