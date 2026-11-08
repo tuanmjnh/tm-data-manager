@@ -9,8 +9,6 @@
 //!   4. open the window on that URL,
 //!   5. kill the core when the app exits.
 
-#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
-
 use std::fs;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
