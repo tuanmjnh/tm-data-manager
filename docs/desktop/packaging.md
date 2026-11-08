@@ -17,6 +17,14 @@ The binary keeps Cargo's `[[bin]]` name (`udmt-desktop`); the visible identity c
 ("UDMT") — Start Menu entry, install folder `%LOCALAPPDATA%\UDMT`, Add/Remove Programs. The window title
 is set separately in `open_main_window`.
 
+### Windows console behavior
+
+The `windows_subsystem = "windows"` attribute belongs on the binary crate entry point at
+`src-tauri/src/main.rs`, not on the reusable library crate in `src-tauri/src/lib.rs`. It is gated by
+`not(debug_assertions)`: release builds (`pnpm run desktop`) launch as a GUI application without a
+console window, while debug builds intentionally keep the console available for diagnostics. The
+bundled Node child process is independently launched with `CREATE_NO_WINDOW` in `spawn_core`.
+
 At launch the shell:
 
 1. picks the first free loopback port in `4004..4019` (a CLI `udmt gui` already on 4004 is fine),
