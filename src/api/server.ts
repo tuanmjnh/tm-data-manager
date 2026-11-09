@@ -287,6 +287,11 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
       return sendJson(res, 200, app.syncState(decodeURIComponent(syncStateMatch[1]!)));
     }
 
+    const syncResetMatch = /^\/api\/sync\/pipelines\/([^/]+)\/reset$/.exec(path);
+    if (syncResetMatch && method === 'POST') {
+      return sendJson(res, 200, app.resetSyncState(decodeURIComponent(syncResetMatch[1]!)));
+    }
+
     if (path === '/api/plugins' && method === 'GET') {
       return sendJson(res, 200, app.listPlugins());
     }

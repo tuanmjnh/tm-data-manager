@@ -71,6 +71,7 @@ export type CapabilityId =
   | 'transactions'
   | 'consistent_snapshot'
   | 'query'
+  | 'incremental_read'
   | 'native_backup'
   | 'native_restore';
 
@@ -347,6 +348,19 @@ export interface SyncFieldMapping {
   value_map?: Record<string, string>;
 }
 
+export type SyncConflictPolicy = 'overwrite' | 'ignore';
+export const SYNC_CONFLICT_POLICIES: SyncConflictPolicy[] = ['overwrite', 'ignore'];
+
+export type SyncSchemaEvolution = 'ignore' | 'add_columns';
+export const SYNC_SCHEMA_EVOLUTION: SyncSchemaEvolution[] = ['ignore', 'add_columns'];
+
+/** Watermark-based incremental reads; requires a provider that declares `incremental_read`. */
+export interface SyncIncrementalOptions {
+  column: string;
+  /** Value used when no checkpoint exists yet; omit to read everything on the first run. */
+  initial?: unknown;
+}
+
 export interface SyncOptions {
   filter?: SyncFilter | null;
   batch_size?: number;
@@ -357,6 +371,9 @@ export interface SyncOptions {
   confirm?: string;
   create_resource?: boolean;
   limit?: number;
+  incremental?: SyncIncrementalOptions | null;
+  conflict_policy?: SyncConflictPolicy;
+  schema_evolution?: SyncSchemaEvolution;
 }
 
 export interface SyncRequest {

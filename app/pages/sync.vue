@@ -310,6 +310,17 @@ async function openDetail(pipeline: SyncPipeline) {
     reportError(error, t('syncPage.detailFailed'))
   }
 }
+
+async function resetCheckpoint(pipeline: SyncPipeline) {
+  try {
+    await api.post(`/sync/pipelines/${encodeURIComponent(pipeline.id)}/reset`, {})
+    detailState.value = null
+    states.value[pipeline.id] = null
+    toast.add({ title: t('syncPage.checkpointReset'), description: pipeline.name, color: 'success', icon: 'i-lucide-rotate-ccw' })
+  } catch (error) {
+    reportError(error, t('syncPage.detailFailed'))
+  }
+}
 </script>
 
 <template>
@@ -535,7 +546,12 @@ async function openDetail(pipeline: SyncPipeline) {
           </div>
 
           <div v-if="detailState" class="grid gap-2">
-            <p class="text-xs uppercase tracking-wide text-muted">{{ $t('syncPage.checkpoint') }}</p>
+            <div class="flex items-center justify-between">
+              <p class="text-xs uppercase tracking-wide text-muted">{{ $t('syncPage.checkpoint') }}</p>
+              <UButton icon="i-lucide-rotate-ccw" size="xs" color="neutral" variant="ghost" @click="resetCheckpoint(detail)">
+                {{ $t('syncPage.resetCheckpoint') }}
+              </UButton>
+            </div>
             <p class="text-xs">{{ $t('syncPage.lastRunAt', { at: detailState.last_run_at ?? '—' }) }} · {{ $t('syncPage.totalRows', { count: detailState.rows_synced }) }}</p>
             <pre class="max-h-40 overflow-auto rounded-lg bg-elevated/60 p-2 text-[11px]">{{ JSON.stringify(detailState.checkpoint, null, 2) }}</pre>
           </div>

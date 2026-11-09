@@ -766,6 +766,30 @@ export class OperationEngine {
         }
       }
 
+      // Incremental (watermark) reads: opt-in, capability-gated, never destructive.
+      const incremental = pipeline.options.incremental ?? null;
+      let incrementalRead: { column: string; after: unknown } | null = null;
+      if (incremental) {
+        const column = incremental.column?.trim();
+        if (!column) throw new UdmtError('INVALID_INPUT', 'Incremental sync needs a watermark column.');
+        if (destructive) {
+          throw new UdmtError('INVALID_INPUT', 'Incremental sync cannot be combined with truncate_and_load.');
+        }
+        if (!hasCapability(sourceDescriptor, 'incremental_read')) {
+          throw new UdmtError(
+            'CAPABILITY_UNSUPPORTED',
+            `Source provider "${source.provider_id}" does not support incremental watermark reads.`,
+          );
+        }
+        if (!sourceSchema.columns.some((entry) => entry.name === column)) {
+          throw new UdmtError('INVALID_INPUT', `Watermark column "${column}" is not in the source schema.`);
+        }
+        const previousState = store.getSyncState(pipeline.id);
+        const previousWatermark = (previousState?.checkpoint as { watermark?: { column?: string; value?: unknown } } | undefined)?.watermark;
+        const after = previousWatermark && previousWatermark.column === column ? previousWatermark.value : (incremental.initial ?? null);
+        incrementalRead = { column, after: after ?? null };
+      }
+
       const dryRun = req.dry_run ?? pipeline.options.dry_run ?? false;
       if (!dryRun) {
         if (destructive && req.confirm !== target.name) {
@@ -783,10 +807,11 @@ export class OperationEngine {
       }
 
       const warnings: string[] = [];
+      const schemaEvolution = pipeline.options.schema_evolution ?? 'ignore';
       if (targetSchema) {
         const existing = new Set(targetSchema.columns.map((column) => column.name));
         const missing = fields.map((field) => field.target).filter((name) => !existing.has(name));
-        if (missing.length > 0) {
+        if (missing.length > 0 && schemaEvolution !== 'add_columns') {
           warnings.push(`Target columns missing (will be created by the provider if allowed): ${missing.join(', ')}`);
         }
       }
@@ -798,7 +823,13 @@ export class OperationEngine {
       const batchSize = req.batch_size ?? pipeline.options.batch_size ?? 1000;
       const onError = req.on_error ?? pipeline.options.on_error ?? 'fail';
       const limit = req.limit ?? pipeline.options.limit;
-      const readColumns = [...new Set([...fields.map((field) => field.source), ...(filter ? [filter.column] : [])])];
+      const readColumns = [
+        ...new Set([
+          ...fields.map((field) => field.source),
+          ...(filter ? [filter.column] : []),
+          ...(incrementalRead ? [incrementalRead.column] : []),
+        ]),
+      ];
       let retries = Math.min(Math.max(pipeline.options.retry?.max_attempts ?? 1, 1), 3);
       if (normalizedMode === 'append') retries = 1; // appending twice is not idempotent
       const backoffMs = Math.min(Math.max(pipeline.options.retry?.backoff_ms ?? 1000, 0), 30_000);
@@ -819,7 +850,13 @@ export class OperationEngine {
         for await (const rows of sourceProvider.readRows!(
           sourceValidated.config,
           sourceSecret,
-          { resource: pipeline.source_resource, batchSize, columns: readColumns, limit: sampleLimit },
+          {
+            resource: pipeline.source_resource,
+            batchSize,
+            columns: readColumns,
+            limit: sampleLimit,
+            ...(incrementalRead ? { incremental: incrementalRead } : {}),
+          },
           ctx,
         )) {
           for (const row of rows) {
@@ -853,6 +890,7 @@ export class OperationEngine {
             rows_matched: matched,
             mapping: fields.map((field) => ({ source: field.source, target: field.target, type: field.cast })),
             target_columns: targetSchema?.columns.map((column) => column.name) ?? null,
+            watermark: incrementalRead ? { column: incrementalRead.column, after: incrementalRead.after ?? null } : null,
             warnings: [...warnings, ...(firstError ? [`First row error: ${firstError}`] : [])],
             errors: sampleErrors.length,
             error_samples: sampleErrors.slice(0, 20),
@@ -864,10 +902,12 @@ export class OperationEngine {
 
       store.updateRunStatus(run.id, 'running', { stage: 'running' });
 
+      let maxWatermark: unknown = incrementalRead?.after ?? null;
       let succeeded = false;
       for (let attempt = 1; attempt <= retries; attempt += 1) {
         stats.attempts = attempt;
         if (attempt > 1) {
+          maxWatermark = incrementalRead?.after ?? null;
           store.clearSyncErrors(run.id);
           stats.errors = 0;
           stats.errors_persisted = 0;
@@ -890,13 +930,21 @@ export class OperationEngine {
               mode: normalizedMode as 'append' | 'upsert' | 'truncate_and_load',
               keyColumns: pipeline.key_columns,
               createResource: pipeline.options.create_resource ?? true,
+              ...(pipeline.options.conflict_policy ? { onConflict: pipeline.options.conflict_policy } : {}),
+              schemaEvolution: pipeline.options.schema_evolution ?? 'ignore',
             },
             async function* (this: OperationEngine): AsyncGenerator<RowBatch> {
               let out: RowBatch = [];
               outer: for await (const rows of sourceProvider.readRows!(
                 sourceValidated.config,
                 sourceSecret,
-                { resource: pipeline.source_resource, batchSize, columns: readColumns, ...(limit ? { limit } : {}) },
+                {
+                  resource: pipeline.source_resource,
+                  batchSize,
+                  columns: readColumns,
+                  ...(limit ? { limit } : {}),
+                  ...(incrementalRead ? { incremental: incrementalRead } : {}),
+                },
                 ctx,
               )) {
                 for (const sourceRow of rows) {
@@ -904,6 +952,10 @@ export class OperationEngine {
                   if (limit && rowIndex >= limit) break outer;
                   rowIndex += 1;
                   stats.rows_read += 1;
+                  if (incrementalRead) {
+                    const value = sourceRow[incrementalRead.column];
+                    if (value !== null && value !== undefined) maxWatermark = maxWatermarkOf(maxWatermark, value);
+                  }
                   try {
                     if (!evaluateSyncFilter(sourceRow, filter)) {
                       stats.rows_filtered += 1;
@@ -947,6 +999,8 @@ export class OperationEngine {
             ctx,
           );
           stats.rows_written = writeResult.rows_written;
+          // Provider-level skips (for example upsert conflict_policy "ignore") must be reported too.
+          stats.rows_skipped += writeResult.rows_skipped;
           warnings.push(...writeResult.warnings);
           succeeded = true;
           break;
@@ -1004,14 +1058,25 @@ export class OperationEngine {
       const previous = store.getSyncState(pipeline.id);
       store.upsertSyncState({
         pipeline_id: pipeline.id,
-        checkpoint: {
-          checkpoint_version: 1,
-          kind: 'full',
-          completed_at: finishedAt,
-          rows_read: stats.rows_read,
-          rows_written: stats.rows_written,
-          rows_filtered: stats.rows_filtered,
-        },
+        checkpoint: incrementalRead
+          ? {
+              checkpoint_version: 1,
+              kind: 'incremental',
+              column: incrementalRead.column,
+              watermark: { column: incrementalRead.column, value: maxWatermark ?? incrementalRead.after ?? null },
+              completed_at: finishedAt,
+              rows_read: stats.rows_read,
+              rows_written: stats.rows_written,
+              rows_filtered: stats.rows_filtered,
+            }
+          : {
+              checkpoint_version: 1,
+              kind: 'full',
+              completed_at: finishedAt,
+              rows_read: stats.rows_read,
+              rows_written: stats.rows_written,
+              rows_filtered: stats.rows_filtered,
+            },
         last_run_id: run.id,
         last_run_at: finishedAt,
         last_status: finalStatus,
@@ -1022,6 +1087,7 @@ export class OperationEngine {
         rows: stats.rows_written,
         errors: stats.errors,
         mode: pipeline.load_mode,
+        ...(incrementalRead ? { watermark: maxWatermark ?? null } : {}),
       }, run.id);
       ctx.log('info', `Sync completed: ${stats.rows_written} rows written, ${stats.rows_skipped} skipped.`);
       return store.requireRun(run.id);
@@ -1303,6 +1369,15 @@ const TRANSIENT_ERROR_CODES = new Set([
  * Retry eligibility for sync runs. Row-level transform errors are never
  * transient; network and lock contention usually are.
  */
+/** Picks the larger of two watermark values, comparing numerically when possible. */
+function maxWatermarkOf(current: unknown, value: unknown): unknown {
+  if (current === null || current === undefined) return value;
+  const left = Number(current);
+  const right = Number(value);
+  if (Number.isFinite(left) && Number.isFinite(right)) return right > left ? value : current;
+  return String(value) > String(current) ? value : current;
+}
+
 function isTransientSyncError(error: unknown): boolean {
   if (isUdmtError(error)) return error.retryable;
   const code = (error as { code?: unknown } | null)?.code;

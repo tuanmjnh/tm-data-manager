@@ -1,6 +1,6 @@
 # Testing strategy
 
-Run with `pnpm test` (vitest). Current suite: **83 tests**, ~18 s, no external services required (the
+Run with `pnpm test` (vitest). Current suite: **89 tests**, ~19 s, no external services required (the
 REST and S3 integration tests start their own local HTTP servers; the plugin tests spawn local child
 processes).
 
@@ -43,6 +43,11 @@ list, download, delete, export→S3→catalog→import round trip, delete protec
 `tests/integration/rest-connector.test.ts` — a local JSON HTTP API: config secrecy, authenticated
 paginated connection test, 401 without leaking the secret, API key in a header, missing-credential
 rejection, and REST → artifact → SQLite import over multiple pages.
+
+`tests/integration/incremental-sync.test.ts` — watermark incremental sync on real SQLite files: only
+rows past the watermark are read on the next run, the watermark advances, checkpoint reset replays,
+`conflict_policy: ignore` skips existing keys, `schema_evolution: add_columns` adds a missing column,
+and incremental + truncate is rejected.
 
 `tests/integration/plugin-host.test.ts` — installs `plugins/sample-jsonapi`, checks trust gating and
 permission subsets, rejects bad/future manifests, runs handshake + discovery + export + import through

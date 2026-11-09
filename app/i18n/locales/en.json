@@ -489,7 +489,9 @@
     "noErrors": "No row errors recorded.",
     "colRow": "Row",
     "colCode": "Code",
-    "colMessage": "Message"
+    "colMessage": "Message",
+    "resetCheckpoint": "Reset checkpoint",
+    "checkpointReset": "Checkpoint cleared"
   },
   "operationsPage": {
     "title": "Operations",

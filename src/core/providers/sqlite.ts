@@ -35,6 +35,7 @@ const CAPS: CapabilityId[] = [
   'schema_write',
   'bulk_write',
   'transactions',
+  'incremental_read',
 ];
 
 const TYPE_MAP: Record<CanonicalType, string> = {
@@ -205,11 +206,28 @@ export class SqliteProvider implements DataProvider {
         ? request.columns.map((col) => quoteIdent(col)).join(', ')
         : '*';
       const limitClause = request.limit ? ` LIMIT ${Math.max(0, Math.trunc(request.limit))}` : '';
-      const stmt = db.prepare(`SELECT ${columns} FROM ${quoteIdent(request.resource)}${limitClause}`);
+      const params: Array<unknown> = [];
+      let whereClause = '';
+      let orderClause = '';
+      if (request.incremental) {
+        const column = request.incremental.column;
+        const known = new Set(
+          (db.prepare(`PRAGMA table_info(${quoteIdent(request.resource)})`).all() as Array<{ name: string }>).map((col) => col.name),
+        );
+        if (!known.has(column)) {
+          throw new UdmtError('INVALID_INPUT', `Incremental watermark column "${column}" does not exist in ${request.resource}.`);
+        }
+        if (request.incremental.after !== null && request.incremental.after !== undefined) {
+          whereClause = ` WHERE ${quoteIdent(column)} > ?`;
+          params.push(request.incremental.after);
+        }
+        orderClause = ` ORDER BY ${quoteIdent(column)} ASC`;
+      }
+      const stmt = db.prepare(`SELECT ${columns} FROM ${quoteIdent(request.resource)}${whereClause}${orderClause}${limitClause}`);
 
       let batch: RowBatch = [];
       let emitted = 0;
-      for (const row of stmt.iterate() as Iterable<Record<string, unknown>>) {
+      for (const row of stmt.iterate(...(params as never[])) as Iterable<Record<string, unknown>>) {
         ctx.throwIfCancelled();
         batch.push(normalizeRow(row));
         emitted += 1;
@@ -281,6 +299,16 @@ export class SqliteProvider implements DataProvider {
         ctx.log('warn', `Truncated ${request.resource} before loading (explicitly confirmed).`);
       }
 
+      // Schema evolution: opt-in, explicit, and only for a target that already exists.
+      if (exists && request.schemaEvolution === 'add_columns') {
+        for (const col of request.columns) {
+          if (existingCols.has(col.name)) continue;
+          db.exec(`ALTER TABLE ${quoteIdent(request.resource)} ADD COLUMN ${quoteIdent(col.name)} ${TYPE_MAP[col.type] ?? 'TEXT'}`);
+          existingCols.add(col.name);
+          ctx.log('warn', `Added missing column ${col.name} to ${request.resource} (schema evolution).`);
+        }
+      }
+
       const insertColumns = request.columns.map((col) => col.name).filter((name) => existingCols.has(name));
       const missing = request.columns.filter((col) => !existingCols.has(col.name)).map((col) => col.name);
       if (missing.length > 0) warnings.push(`Columns not present in target ignored: ${missing.join(', ')}`);
@@ -288,8 +316,12 @@ export class SqliteProvider implements DataProvider {
         throw new UdmtError('INVALID_INPUT', 'No importable columns matched the target table.');
       }
 
-      const conflictClause = buildConflictClause(request, existingCols);
-      const insertSqlBase = `INSERT ${request.mode === 'upsert' ? 'OR REPLACE ' : ''}INTO ${quoteIdent(request.resource)} (${insertColumns
+      const onConflict = request.onConflict ?? 'overwrite';
+      const conflictClause = buildConflictClause(request, existingCols, onConflict);
+      // When an explicit conflict target is used, plain INSERT + the ON CONFLICT clause is correct;
+      // OR REPLACE would bypass `DO NOTHING` and always overwrite.
+      const replacePrefix = request.mode === 'upsert' && !conflictClause ? 'OR REPLACE ' : '';
+      const insertSqlBase = `INSERT ${replacePrefix}INTO ${quoteIdent(request.resource)} (${insertColumns
         .map(quoteIdent)
         .join(', ')})`;
 
@@ -306,9 +338,12 @@ export class SqliteProvider implements DataProvider {
         }
 
         if (conflictClause) {
+          const statement = db.prepare(`${insertSqlBase} VALUES (${insertColumns.map(() => '?').join(', ')}) ${conflictClause}`);
           for (const row of values) {
-            db.prepare(`${insertSqlBase} VALUES (${row.map(() => '?').join(', ')}) ${conflictClause}`).run(...(row as never[]));
-            written += 1;
+            const result = statement.run(...(row as never[]));
+            // `DO NOTHING` reports zero changed rows; count those as skipped, not written.
+            if (Number(result.changes) > 0) written += 1;
+            else skipped += 1;
           }
         } else {
           const placeholders = `(${insertColumns.map(() => '?').join(', ')})`;
@@ -333,10 +368,11 @@ export class SqliteProvider implements DataProvider {
   }
 }
 
-function buildConflictClause(request: WriteRequest, existingCols: Set<string>): string {
+function buildConflictClause(request: WriteRequest, existingCols: Set<string>, onConflict: 'overwrite' | 'ignore'): string {
   if (request.mode !== 'upsert') return '';
   const keys = (request.keyColumns ?? []).filter((key) => existingCols.has(key));
   if (keys.length === 0) return '';
+  if (onConflict === 'ignore') return `ON CONFLICT (${keys.map(quoteIdent).join(', ')}) DO NOTHING`;
   const updates = request.columns
     .map((col) => col.name)
     .filter((name) => existingCols.has(name) && !keys.includes(name));

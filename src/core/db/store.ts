@@ -589,6 +589,11 @@ export class Store {
     return state;
   }
 
+  /** Clears the checkpoint (including any watermark) so the next run replays from scratch. */
+  deleteSyncState(pipelineId: string): void {
+    this.db.run('DELETE FROM sync_states WHERE pipeline_id = ?', pipelineId);
+  }
+
   recordSyncError(input: {
     run_id: string;
     pipeline_id: string | null;

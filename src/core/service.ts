@@ -34,6 +34,8 @@ import type {
   PluginRecord,
   PluginTestResult,
   RowBatch,
+  SyncConflictPolicy,
+  SyncSchemaEvolution,
   RowsPreview,
   ScheduleRecord,
   StorageBackendRecord,
@@ -48,7 +50,16 @@ import type {
   SyncStateRecord,
   WorkerInstance,
 } from './types.js';
-import { ENVIRONMENTS, PLUGIN_PERMISSIONS, PREVIEW_ROW_LIMIT, STORAGE_BACKEND_TYPES, SYNC_LOAD_MODES, pluginProviderId } from './types.js';
+import {
+  ENVIRONMENTS,
+  PLUGIN_PERMISSIONS,
+  PREVIEW_ROW_LIMIT,
+  STORAGE_BACKEND_TYPES,
+  SYNC_CONFLICT_POLICIES,
+  SYNC_LOAD_MODES,
+  SYNC_SCHEMA_EVOLUTION,
+  pluginProviderId,
+} from './types.js';
 import { readPluginManifest } from './plugins/manifest.js';
 import { ExternalProvider } from './plugins/provider.js';
 
@@ -813,7 +824,7 @@ export class UdmtApp {
       mapping: this.normalizeSyncMapping(input.mapping ?? []),
       load_mode: loadMode,
       key_columns: keyColumns,
-      options: this.normalizeSyncOptions(input.options ?? {}),
+      options: this.normalizeSyncOptions(input.options ?? {}, loadMode),
       enabled: input.enabled ?? true,
     });
     this.store.audit('sync.pipeline_created', { pipeline: created.name, mode: created.load_mode });
@@ -848,7 +859,7 @@ export class UdmtApp {
       mapping,
       load_mode: loadMode,
       key_columns: keyColumns,
-      options: patch.options ? this.normalizeSyncOptions({ ...existing.options, ...patch.options }) : existing.options,
+      options: patch.options ? this.normalizeSyncOptions({ ...existing.options, ...patch.options }, loadMode) : existing.options,
       enabled: patch.enabled ?? existing.enabled,
     });
     this.store.audit('sync.pipeline_updated', { pipeline: updated.name });
@@ -869,6 +880,14 @@ export class UdmtApp {
   syncState(idOrName: string): SyncStateRecord | null {
     const pipeline = this.store.requireSyncPipeline(idOrName);
     return this.store.getSyncState(pipeline.id) ?? null;
+  }
+
+  /** Clears the checkpoint/watermark so the next run replays fully (roadmap 21 Phase 8 replay). */
+  resetSyncState(idOrName: string): SyncStateRecord | null {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    this.store.deleteSyncState(pipeline.id);
+    this.store.audit('sync.checkpoint_reset', { pipeline: pipeline.name });
+    return null;
   }
 
   syncErrors(runIdOrPrefix: string, limit = 200): SyncRunError[] {
@@ -966,7 +985,7 @@ export class UdmtApp {
     return keys;
   }
 
-  private normalizeSyncOptions(options: SyncOptions): SyncOptions {
+  private normalizeSyncOptions(options: SyncOptions, loadMode: SyncLoadMode): SyncOptions {
     if (options.batch_size !== undefined && (!Number.isInteger(options.batch_size) || options.batch_size < 1 || options.batch_size > 5000)) {
       throw new UdmtError('INVALID_INPUT', 'Sync batch_size must be between 1 and 5000.');
     }
@@ -978,6 +997,20 @@ export class UdmtApp {
     }
     if (options.filter?.operator === 'in' && !Array.isArray(options.filter.value)) {
       throw new UdmtError('INVALID_INPUT', 'Sync filter operator "in" needs an array value.');
+    }
+    if (options.incremental) {
+      if (!options.incremental.column?.trim()) {
+        throw new UdmtError('INVALID_INPUT', 'Incremental sync needs a watermark column.');
+      }
+      if (loadMode === 'truncate_and_load' || loadMode === 'replace_resource') {
+        throw new UdmtError('INVALID_INPUT', 'Incremental sync cannot be combined with a destructive load mode.');
+      }
+    }
+    if (options.conflict_policy !== undefined && !SYNC_CONFLICT_POLICIES.includes(options.conflict_policy as SyncConflictPolicy)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown conflict_policy: ${String(options.conflict_policy)}`);
+    }
+    if (options.schema_evolution !== undefined && !SYNC_SCHEMA_EVOLUTION.includes(options.schema_evolution as SyncSchemaEvolution)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown schema_evolution: ${String(options.schema_evolution)}`);
     }
     return options;
   }

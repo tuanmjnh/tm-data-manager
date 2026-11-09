@@ -489,7 +489,9 @@
     "noErrors": "Không có lỗi dòng nào.",
     "colRow": "Dòng",
     "colCode": "Mã",
-    "colMessage": "Thông báo"
+    "colMessage": "Thông báo",
+    "resetCheckpoint": "Xóa điểm lưu",
+    "checkpointReset": "Đã xóa điểm lưu"
   },
   "operationsPage": {
     "title": "Tác vụ",

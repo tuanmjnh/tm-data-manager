@@ -1095,6 +1095,17 @@ sync
   });
 
 sync
+  .command('reset')
+  .argument('<pipeline>')
+  .description('Clear the checkpoint/watermark so the next run replays fully')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      app.resetSyncState(idOrName);
+      process.stdout.write(`Cleared sync state for ${idOrName}. The next run reads from the beginning.\n`);
+    });
+  });
+
+sync
   .command('errors')
   .argument('<run>')
   .description('Show persisted row errors for a sync run')

@@ -465,6 +465,80 @@ no OS-level sandbox or package signing)
 ```
 
 ```
+PHASE: 8 — Incremental sync, CDC and advanced replication
+STATUS: partial — watermark incremental sync, conflict policy, schema evolution and replay are
+implemented and tested against SQLite; CDC/change streams are intentionally NOT published because no
+provider could be verified here
+
+1. Implemented
+- New `incremental_read` provider capability. Only providers that declare it are allowed to serve a
+  watermark read, so an unverified provider can never be silently used for incremental sync.
+- Watermark read contract: `ReadRequest.incremental = { column, after }` reads rows `WHERE column >
+  after` ordered ascending, with `after: null` meaning "everything". SQLite implements it; it is the
+  only provider that declares `incremental_read` today.
+- Sync engine: when a pipeline sets `options.incremental = { column, initial? }` the engine loads the
+  last watermark from `sync_states`, validates the column against the source schema and the provider
+  capability, and passes the watermark down. The highest value seen is stored back as
+  `checkpoint.watermark` with `kind: "incremental"` only after a successful run (a failed run keeps the
+  previous watermark, so the next attempt replays the same window).
+- Conflict policy: `options.conflict_policy = "overwrite" (default) | "ignore"` for upserts. SQLite
+  applies `ON CONFLICT DO UPDATE` / `DO NOTHING`; skipped keys are counted and reported (the run ends
+  `completed_with_warnings`, never silently). This also fixed a real bug: provider-level skipped rows
+  were not added to the run totals.
+- Schema evolution: `options.schema_evolution = "add_columns"` lets a provider add missing target
+  columns instead of ignoring them. SQLite executes `ALTER TABLE ... ADD COLUMN`; the preflight
+  "missing column" warning is suppressed only when the option will handle it.
+- Replay/recovery: `UdmtApp.resetSyncState`, `udmt sync reset <pipeline>` and
+  `POST /api/sync/pipelines/:id/reset` clear the checkpoint/watermark so the next run replays fully;
+  the GUI checkpoint panel has a "Reset checkpoint" action.
+- Safety: incremental + `truncate_and_load` is rejected at pipeline creation; incremental never
+  applies to append retries (still disabled); the run result and state expose the watermark.
+
+2. Files changed
+- `src/core/types.ts` (capability + sync options/constants), `src/core/providers/contract.ts`
+  (`incremental_read`, `ReadRequest.incremental`, `WriteRequest.onConflict/schemaEvolution`),
+  `src/core/providers/sqlite.ts` (watermark read, conflict policy, schema evolution, capability),
+  `src/core/operation/engine.ts`, `src/core/db/store.ts` (`deleteSyncState`), `src/core/service.ts`,
+  `src/api/server.ts`, `src/cli/bin.ts`, `app/{pages/sync.vue,types.ts,i18n/locales/*}`,
+  `tests/integration/incremental-sync.test.ts` (new), this file,
+  `docs/architecture/data-sync.md`, `docs/testing/provider-contract-tests.md`.
+
+3. Database migrations
+- none. The watermark lives inside the existing versioned `sync_states.checkpoint_json`
+  (`checkpoint_version: 1`), so no schema change was needed.
+
+4. Tests executed
+- `pnpm run typecheck` clean; `pnpm test` 89/89 passing; `pnpm run check:i18n` clean; server + GUI build.
+- Integration (6, real SQLite files): first run copies 100 rows and stores watermark 100; after adding
+  10 rows the second run reads/writes only 10 and advances to 110; checkpoint reset replays all rows;
+  `conflict_policy: ignore` keeps an existing conflicting row and reports 1 skipped;
+  `schema_evolution: add_columns` adds the missing column and writes its values; incremental + truncate
+  is rejected; SQLite advertises `incremental_read`.
+
+5. Manual verification
+- Covered by the integration suite (real source/target databases and the real engine, same code path as
+  the CLI/GUI). The watermark clearly advances across runs (100 → 110) and resets to replay.
+
+6. Known limitations / risks
+- Only SQLite is verified for incremental reads. PostgreSQL/MySQL/MongoDB are not published with
+  `incremental_read`; enabling it for them requires their own consistency/recovery tests first.
+- The watermark assumes a strictly monotonic column (an auto-increment id or an append-only timestamp).
+  Updates to already-synced rows are invisible to watermark mode; use `upsert` + `conflict_policy` or a
+  full sync for that.
+- CDC/change streams (MongoDB change streams, logical replication) are NOT implemented; no capability
+  claims them. Adding them requires a live server to test consistency, recovery and failure scenarios.
+- Conflict policy and schema evolution are implemented for SQLite only; other providers ignore the write
+  options (a missing column still fails loudly rather than dropping data).
+- Cumulative `rows_synced` counts written rows, not distinct/updated rows.
+- No lag/throughput metrics beyond `last_run_at`, `last_status` and the watermark; a true data lag
+  would require a provider-side `MAX(column)` query, which is not published yet.
+
+7. Next recommended phase
+- CDC/change-stream adapters and replication lag metrics, each gated behind provider-specific
+  consistency tests; or code signing + auto-update for distribution.
+```
+
+```
 PHASE: GUI (roadmap section 14, delivered with Phase 1–3)
 STATUS: completed for the implemented features
 
@@ -573,7 +647,7 @@ STATUS: completed and built end-to-end on Windows
 | Gate | Result |
 |---|---|
 | Release target builds | ✅ `pnpm run build` + `nuxt generate` + `tauri build` (NSIS installer) |
-| Important tests pass | ✅ 76/76 vitest + 4/4 cargo |
+| Important tests pass | ✅ 89/89 vitest + 4/4 cargo |
 | UI actions wired to a real backend | ✅ no mock data in the app |
 | Task state persisted | ✅ SQLite runs/logs |
 | No secret in logs/DB plaintext | ✅ tested |

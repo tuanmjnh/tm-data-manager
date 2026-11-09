@@ -72,7 +72,7 @@ reports matched rows and error samples, writes nothing and does not update the c
 
 ## Checkpoint state
 
-`sync_states.checkpoint_json` currently records:
+A full run stores a summary:
 
 ```json
 {
@@ -85,8 +85,49 @@ reports matched rows and error samples, writes nothing and does not update the c
 }
 ```
 
-A failed run stores a `partial: true` snapshot with the failure time. This is a run summary, not a
-resumable cursor. Incremental watermarks, CDC and conflict policies are Phase 8.
+A failed run stores a `partial: true` snapshot with the failure time.
+
+## Incremental (watermark) sync
+
+Set `options.incremental = { column, initial? }` on a pipeline to sync only new rows:
+
+```json
+{ "incremental": { "column": "id" }, "batch_size": 500 }
+```
+
+- Requires the source provider to declare the `incremental_read` capability (SQLite does; the other
+  built-ins do not yet). Otherwise the run fails with `CAPABILITY_UNSUPPORTED` — the engine never
+  falls back to a full read silently.
+- The provider reads `WHERE column > after ORDER BY column ASC`; `after: null` reads everything.
+- The highest value seen is stored as `checkpoint.watermark` with `kind: "incremental"` **only after a
+  successful run**, so a failure replays the same window:
+
+```json
+{
+  "checkpoint_version": 1,
+  "kind": "incremental",
+  "column": "id",
+  "watermark": { "column": "id", "value": 110 },
+  "completed_at": "...",
+  "rows_read": 10,
+  "rows_written": 10
+}
+```
+
+- Incremental cannot be combined with `truncate_and_load` (rejected at pipeline creation).
+- `udmt sync reset <pipeline>` / `POST /api/sync/pipelines/:id/reset` clears the checkpoint to replay.
+- Limitation: the watermark assumes a monotonic column. In-place updates to old rows are not seen; use
+  `upsert` with `conflict_policy` or a full sync for those.
+
+## Conflict policy and schema evolution
+
+- `options.conflict_policy`: `overwrite` (default) or `ignore`. For `upsert`, `ignore` skips existing
+  keys (`ON CONFLICT DO NOTHING` on SQLite); skipped keys are counted and the run ends
+  `completed_with_warnings`.
+- `options.schema_evolution`: `ignore` (default) or `add_columns`. `add_columns` lets a capable provider
+  add missing target columns (`ALTER TABLE ... ADD COLUMN` on SQLite) instead of ignoring them.
+
+CDC/change streams and replication lag metrics are not implemented; no provider declares them.
 
 ## Surfaces
 

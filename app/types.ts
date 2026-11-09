@@ -206,6 +206,9 @@ export interface SyncOptions {
   confirm?: string
   create_resource?: boolean
   limit?: number
+  incremental?: { column: string; initial?: unknown } | null
+  conflict_policy?: 'overwrite' | 'ignore'
+  schema_evolution?: 'ignore' | 'add_columns'
 }
 
 export interface SyncPipeline {
