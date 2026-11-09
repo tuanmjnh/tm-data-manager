@@ -1,0 +1,36 @@
+{
+  "manifest_version": 1,
+  "id": "sample.jsonapi",
+  "name": "Sample JSON API provider",
+  "version": "1.0.0",
+  "protocol": "udmt-provider/1",
+  "description": "Reference external provider: serves an in-memory dataset and echoes written rows. Used by the plugin host contract tests.",
+  "runtime": {
+    "command": "node",
+    "args": ["plugin.mjs"]
+  },
+  "permissions": ["read_config", "read_secrets"],
+  "provider": {
+    "display_name": "Sample JSON API",
+    "version": "1.0.0",
+    "capabilities": ["test_connection", "discover_resources", "read_data", "write_data", "schema_read", "bulk_write"],
+    "config_fields": [
+      {
+        "name": "dataset",
+        "label": "Dataset name",
+        "type": "text",
+        "required": true,
+        "default": "items",
+        "help": "Any non-empty value; kept to demonstrate required-field validation."
+      },
+      {
+        "name": "api_token",
+        "label": "API token (optional)",
+        "type": "password",
+        "required": false,
+        "help": "Passed to the plugin as a secret only when the read_secrets permission is granted."
+      }
+    ],
+    "secret_fields": ["api_token"]
+  }
+}

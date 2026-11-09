@@ -51,3 +51,23 @@ Safety rules during prune:
 
 The manifest holds the columns and types, row count, checksum, provider, run parameters and warnings.
 Because of it, the file can still be imported elsewhere once the catalog is gone.
+
+## Remote storage (S3, R2, MinIO, B2)
+
+Artifacts can live in S3-compatible object storage instead of the local data directory. Add a backend on
+the **Storage** page (or with the CLI):
+
+```bash
+udmt storage add --name r2-backups --type s3 --endpoint https://<account>.r2.cloudflarestorage.com \
+  --bucket udmt-artifacts --prefix udmt --access-key-id <key> --secret-access-key-stdin
+udmt storage test r2-backups
+udmt storage default r2-backups
+```
+
+- Credentials are write-only: they are stored in the encrypted vault and never written to the catalog,
+  logs or exports.
+- Exports still stream to a local staging file first, then upload the data file and its manifest. The
+  catalog records an `s3://bucket/key` locator.
+- Imports download the object to staging before the normal streaming import, then remove the temporary
+  file.
+- Deleting a backend is refused while it still owns artifacts or is the default backend.

@@ -5,7 +5,7 @@ import { newWorkerInstance } from './service.js';
 import { nextRunAt, type ScheduleInput } from './scheduler.js';
 import { isUdmtError } from './errors.js';
 import { nowIso, newId } from './utils.js';
-import type { ExportRequest, ImportRequest, OperationRun, ScheduleRecord, WorkerInstance } from './types.js';
+import type { ExportRequest, ImportRequest, OperationRun, ScheduleRecord, SyncRequest, WorkerInstance } from './types.js';
 
 const HEARTBEAT_MS = 10_000;
 const STALE_HEARTBEAT_MS = 60_000;
@@ -174,6 +174,16 @@ export class WorkerRuntime {
           ...(typeof config.format === 'string' ? { format: config.format as ImportRequest['format'] } : {}),
         };
         started = this.app.engine.startImport(request, { jobId: job.id, workerId: this.instance.id });
+      } else if (job.operation_type === 'sync') {
+        const request: SyncRequest = {
+          pipeline_id: String(config.pipeline_id ?? ''),
+          ...(typeof config.dry_run === 'boolean' ? { dry_run: config.dry_run } : {}),
+          ...(typeof config.limit === 'number' ? { limit: config.limit } : {}),
+          ...(typeof config.batch_size === 'number' ? { batch_size: config.batch_size } : {}),
+          ...(config.on_error === 'fail' || config.on_error === 'skip' ? { on_error: config.on_error } : {}),
+          ...(typeof config.confirm === 'string' ? { confirm: config.confirm } : {}),
+        };
+        started = this.app.engine.startSync(request, { jobId: job.id, workerId: this.instance.id });
       }
 
       store.updateSchedule(schedule.id, {

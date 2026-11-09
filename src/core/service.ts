@@ -8,9 +8,11 @@ import { ensureAppDirs, resolveAppPaths, type AppPaths } from './paths.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { SecretStore } from './secrets.js';
 import { LocalStorageBackend } from './storage/local.js';
+import { createStorageBackend as buildStorageBackend, managedLocalBackend } from './storage/index.js';
+import type { StorageBackend } from './storage/contract.js';
 import { OperationEngine } from './operation/engine.js';
 import { describeSchedule, nextRunAt, validateSchedule, type ScheduleInput } from './scheduler.js';
-import { UdmtError, toUdmtError } from './errors.js';
+import { UdmtError, sanitizeErrorMessage, toUdmtError } from './errors.js';
 import { APP_VERSION, newId, nowIso, sanitizeName, sha256File, truncate } from './utils.js';
 import type {
   ArtifactRecord,
@@ -28,13 +30,67 @@ import type {
   ProviderDescriptor,
   ResourceDescriptor,
   ResourceSchema,
+  PluginPermission,
+  PluginRecord,
+  PluginTestResult,
   RowBatch,
+  SyncConflictPolicy,
+  SyncSchemaEvolution,
   RowsPreview,
   ScheduleRecord,
   StorageBackendRecord,
+  StorageBackendType,
+  StorageTestResult,
+  SyncFieldMapping,
+  SyncLoadMode,
+  SyncOptions,
+  SyncPipelineRecord,
+  SyncRequest,
+  SyncRunError,
+  SyncStateRecord,
   WorkerInstance,
 } from './types.js';
-import { ENVIRONMENTS, PREVIEW_ROW_LIMIT } from './types.js';
+import {
+  ENVIRONMENTS,
+  PLUGIN_PERMISSIONS,
+  PREVIEW_ROW_LIMIT,
+  STORAGE_BACKEND_TYPES,
+  SYNC_CONFLICT_POLICIES,
+  SYNC_LOAD_MODES,
+  SYNC_SCHEMA_EVOLUTION,
+  pluginProviderId,
+} from './types.js';
+import { readPluginManifest } from './plugins/manifest.js';
+import { ExternalProvider } from './plugins/provider.js';
+
+export interface CreateSyncPipelineInput {
+  name: string;
+  source_connection_id: string;
+  target_connection_id: string;
+  source_resource: string;
+  target_resource: string;
+  mapping?: SyncFieldMapping[];
+  load_mode?: SyncLoadMode;
+  key_columns?: string[];
+  options?: SyncOptions;
+  enabled?: boolean;
+}
+
+export type UpdateSyncPipelineInput = Partial<Omit<CreateSyncPipelineInput, 'name'>> & { name?: string };
+
+export interface CreateStorageBackendInput {
+  name: string;
+  backend_type: StorageBackendType;
+  config?: Record<string, unknown>;
+  secret?: Record<string, unknown>;
+  is_default?: boolean;
+}
+
+export interface UpdateStorageBackendInput {
+  name?: string;
+  config?: Record<string, unknown>;
+  secret?: Record<string, unknown>;
+}
 
 export interface CreateConnectionInput {
   name: string;
@@ -75,8 +131,10 @@ export class UdmtApp {
   readonly store: Store;
   readonly secrets: SecretStore;
   readonly registry: ProviderRegistry;
-  readonly storage: LocalStorageBackend;
+  /** Always-present local backend; used for staging and safe fallback. */
+  readonly managedStorage: LocalStorageBackend;
   readonly engine: OperationEngine;
+  private readonly externalProviders = new Map<string, ExternalProvider>();
 
   constructor(options: { dataDir?: string } = {}) {
     this.paths = resolveAppPaths(options.dataDir);
@@ -86,14 +144,16 @@ export class UdmtApp {
       this.store = new Store(this.db);
       this.secrets = new SecretStore(this.db, this.paths);
       this.registry = new ProviderRegistry();
-      this.storage = new LocalStorageBackend(this.paths);
+      this.managedStorage = managedLocalBackend(this.paths);
       this.engine = new OperationEngine({
         store: this.store,
         registry: this.registry,
         secrets: this.secrets,
         paths: this.paths,
-        storage: this.storage,
+        managedStorage: this.managedStorage,
+        resolveStorage: (idOrName) => this.storageBackend(idOrName),
       });
+      this.loadPlugins();
     } catch (error) {
       // Never leak a locked metadata database when startup fails.
       this.db.close();
@@ -102,6 +162,7 @@ export class UdmtApp {
   }
 
   close(): void {
+    for (const provider of this.externalProviders.values()) void provider.shutdown();
     this.db.close();
   }
 
@@ -276,6 +337,187 @@ export class UdmtApp {
     };
   }
 
+  // ------------------------------------------------------------------ plugins
+  private loadPlugins(): void {
+    for (const record of this.store.listPlugins()) {
+      if (record.enabled && record.trusted && record.status !== 'error') {
+        this.registerPluginProvider(record);
+      }
+    }
+  }
+
+  private registerPluginProvider(record: PluginRecord): ExternalProvider {
+    const provider = new ExternalProvider(record);
+    this.registry.register(provider);
+    this.externalProviders.set(record.id, provider);
+    return provider;
+  }
+
+  private unregisterPluginProvider(id: string): void {
+    const existing = this.externalProviders.get(id);
+    if (existing) {
+      void existing.shutdown();
+      this.externalProviders.delete(id);
+    }
+    this.registry.remove(pluginProviderId(id));
+  }
+
+  listPlugins(): PluginRecord[] {
+    return this.store.listPlugins();
+  }
+
+  getPlugin(id: string): PluginRecord {
+    return this.store.requirePlugin(id);
+  }
+
+  /**
+   * Installs a plugin from a local folder containing `udmt-plugin.json`. Plugins
+   * start disabled and untrusted: nothing is executed and no provider is exposed
+   * until the user grants the requested permissions.
+   */
+  installPlugin(input: { path: string; enabled?: boolean; trusted?: boolean; granted_permissions?: PluginPermission[] }): PluginRecord {
+    const { manifest, installPath } = readPluginManifest(input.path);
+    if (this.store.getPlugin(manifest.id)) {
+      throw new UdmtError('ALREADY_EXISTS', `Plugin "${manifest.id}" is already installed. Use update instead.`);
+    }
+    const requested = manifest.permissions ?? [];
+    const granted = this.resolveGrantedPermissions(requested, input.granted_permissions ?? (input.trusted ? requested : []));
+    const trusted = input.trusted ?? false;
+    const enabled = input.enabled ?? false;
+    const record = this.store.createPlugin({
+      id: manifest.id,
+      name: manifest.name,
+      version: manifest.version,
+      protocol_version: manifest.protocol,
+      description: manifest.description ?? null,
+      manifest,
+      install_path: installPath,
+      enabled,
+      trusted,
+      requested_permissions: requested,
+      granted_permissions: granted,
+      status: enabled && trusted ? 'installed' : 'disabled',
+    });
+    this.store.audit('plugin.installed', { plugin: record.id, version: record.version, trusted: record.trusted });
+    if (record.enabled && record.trusted) this.registerPluginProvider(record);
+    return record;
+  }
+
+  updatePlugin(id: string): PluginRecord {
+    const existing = this.store.requirePlugin(id);
+    const { manifest, installPath } = readPluginManifest(existing.install_path);
+    if (manifest.id !== existing.id) {
+      throw new UdmtError('INVALID_INPUT', `Manifest id "${manifest.id}" does not match the installed plugin "${existing.id}".`);
+    }
+    const requested = manifest.permissions ?? [];
+    const granted = this.resolveGrantedPermissions(requested, existing.granted_permissions);
+    const updated = this.store.updatePlugin(existing.id, {
+      name: manifest.name,
+      version: manifest.version,
+      protocol_version: manifest.protocol,
+      description: manifest.description ?? null,
+      manifest,
+      install_path: installPath,
+      requested_permissions: requested,
+      granted_permissions: granted,
+      status: existing.enabled && existing.trusted ? 'installed' : 'disabled',
+    });
+    this.unregisterPluginProvider(id);
+    if (updated.enabled && updated.trusted) this.registerPluginProvider(updated);
+    this.store.audit('plugin.updated', { plugin: updated.id, version: updated.version });
+    return updated;
+  }
+
+  setPluginTrust(id: string, input: { trusted: boolean; granted_permissions?: PluginPermission[] }): PluginRecord {
+    const existing = this.store.requirePlugin(id);
+    const granted = input.trusted
+      ? this.resolveGrantedPermissions(existing.requested_permissions, input.granted_permissions ?? existing.requested_permissions)
+      : [];
+    const updated = this.store.updatePlugin(id, {
+      trusted: input.trusted,
+      granted_permissions: granted,
+      status: existing.enabled && input.trusted ? 'installed' : 'disabled',
+      last_error: null,
+    });
+    this.unregisterPluginProvider(id);
+    if (updated.enabled && updated.trusted) this.registerPluginProvider(updated);
+    this.store.audit('plugin.trust_changed', { plugin: id, trusted: input.trusted, granted });
+    return updated;
+  }
+
+  setPluginEnabled(id: string, enabled: boolean): PluginRecord {
+    const existing = this.store.requirePlugin(id);
+    if (enabled && !existing.trusted) {
+      throw new UdmtError('PRECONDITION_FAILED', `Plugin "${id}" must be trusted before it can be enabled.`);
+    }
+    const updated = this.store.updatePlugin(id, {
+      enabled,
+      status: enabled ? 'installed' : 'disabled',
+      last_error: null,
+    });
+    this.unregisterPluginProvider(id);
+    if (updated.enabled && updated.trusted) this.registerPluginProvider(updated);
+    this.store.audit(enabled ? 'plugin.enabled' : 'plugin.disabled', { plugin: id });
+    return updated;
+  }
+
+  removePlugin(id: string): void {
+    this.store.requirePlugin(id);
+    this.unregisterPluginProvider(id);
+    this.store.deletePlugin(id);
+    this.store.audit('plugin.removed', { plugin: id });
+  }
+
+  /** Handshakes the plugin process and reports protocol/version/capabilities. */
+  async testPlugin(id: string): Promise<PluginTestResult> {
+    const record = this.store.requirePlugin(id);
+    if (!record.trusted) throw new UdmtError('PRECONDITION_FAILED', `Plugin "${id}" is not trusted.`);
+    const provider = new ExternalProvider(record);
+    const startedAt = Date.now();
+    try {
+      const logs = await provider.reset();
+      this.store.updatePlugin(id, { status: 'installed', last_error: null, last_handshake_at: nowIso() });
+      return {
+        success: true,
+        protocol_version: record.protocol_version,
+        server: { name: record.name, version: record.version },
+        capabilities: record.manifest.provider.capabilities,
+        latency_ms: Date.now() - startedAt,
+        diagnostics: logs.slice(-10).map((line) => sanitizePluginLine(line)),
+        tested_at: nowIso(),
+      };
+    } catch (error) {
+      const udmt = toUdmtError(error, 'CONNECTION_FAILED');
+      this.store.updatePlugin(id, { status: 'error', last_error: udmt.message });
+      return {
+        success: false,
+        protocol_version: null,
+        server: null,
+        capabilities: [],
+        latency_ms: Date.now() - startedAt,
+        diagnostics: [sanitizePluginLine(udmt.message)],
+        tested_at: nowIso(),
+      };
+    } finally {
+      await provider.shutdown();
+    }
+  }
+
+  pluginDiagnostics(id: string): string[] {
+    const provider = this.externalProviders.get(id);
+    return (provider?.diagnostics() ?? []).map((line) => sanitizePluginLine(line));
+  }
+
+  private resolveGrantedPermissions(requested: PluginPermission[], granted: PluginPermission[]): PluginPermission[] {
+    const unknown = granted.filter((permission) => !PLUGIN_PERMISSIONS.includes(permission));
+    if (unknown.length > 0) throw new UdmtError('INVALID_INPUT', `Unknown plugin permission: ${unknown.join(', ')}`);
+    const extra = granted.filter((permission) => !requested.includes(permission));
+    if (extra.length > 0) {
+      throw new UdmtError('INVALID_INPUT', `Plugin did not request these permissions: ${extra.join(', ')}`);
+    }
+    return [...new Set(granted)];
+  }
+
   // ------------------------------------------------------------------ operations
   exportData(request: ExportRequest) {
     return this.engine.export(request);
@@ -329,15 +571,37 @@ export class UdmtApp {
     return this.store.requireArtifact(id);
   }
 
-  deleteArtifact(id: string): void {
+  async deleteArtifact(id: string): Promise<void> {
     const artifact = this.store.requireArtifact(id);
     if (artifact.pinned) throw new UdmtError('CONFLICT', 'Artifact is pinned. Unpin it before deleting.');
     const verifying = this.store
       .listRuns({ limit: 100 })
       .some((run) => run.operation_type === 'verify' && run.source_label === id && !isTerminal(run.status));
     if (verifying) throw new UdmtError('CONFLICT', 'Artifact is being verified right now.');
+    await this.removeArtifactObject(artifact);
     this.store.deleteArtifactRecord(id);
     this.store.audit('artifact.deleted', { artifact_id: id, path: artifact.absolute_path });
+  }
+
+  /**
+   * Deletes the bytes behind an artifact without touching its record. External
+   * files are removed by absolute path; managed artifacts go through the storage
+   * backend so S3/R2 objects and named local roots behave the same.
+   */
+  private async removeArtifactObject(artifact: ArtifactRecord): Promise<void> {
+    if (artifact.manifest.output_mode === 'external' || /^[A-Za-z]:[\\/]|^\//.test(artifact.object_key)) {
+      await rm(artifact.absolute_path, { force: true }).catch(() => undefined);
+      await rm(`${artifact.absolute_path}.manifest.json`, { force: true }).catch(() => undefined);
+      return;
+    }
+    try {
+      const backend = this.storageBackend(artifact.storage_backend_id);
+      await backend.deleteObject(artifact.object_key);
+      await backend.deleteObject(`${artifact.object_key}.manifest.json`).catch(() => undefined);
+    } catch (error) {
+      // A missing backend should not strand the metadata row; surface the reason.
+      if ((error as UdmtError).code !== 'NOT_FOUND') throw error;
+    }
   }
 
   /**
@@ -380,11 +644,18 @@ export class UdmtApp {
           return;
         }
         try {
-          if (existsSync(artifact.absolute_path)) {
-            // Only delete inside the managed root, or the exact external file we created.
-            const managed = artifact.absolute_path.startsWith(this.storage.root);
-            if (!managed && artifact.manifest.output_mode !== 'external') {
-              skipped.push(`${artifact.id}: outside managed root`);
+          if (artifact.manifest.output_mode !== 'external') {
+            // Only delete inside a managed root. A named backend resolves its
+            // own root; remote artifacts never have a local file to inspect.
+            try {
+              const backend = this.storageBackend(artifact.storage_backend_id);
+              const local = !backend.isRemote && existsSync(artifact.absolute_path);
+              if (local && !artifact.absolute_path.startsWith((backend as LocalStorageBackend).root)) {
+                skipped.push(`${artifact.id}: outside managed root`);
+                return;
+              }
+            } catch {
+              skipped.push(`${artifact.id}: storage backend missing`);
               return;
             }
           }
@@ -398,13 +669,17 @@ export class UdmtApp {
 
     if (!options.dry_run) {
       for (const artifact of deleted) {
-        await rm(artifact.absolute_path, { force: true }).catch(() => undefined);
-        await rm(`${artifact.absolute_path}.manifest.json`, { force: true }).catch(() => undefined);
+        try {
+          await this.removeArtifactObject(artifact);
+        } catch (error) {
+          skipped.push(`${artifact.id}: ${(error as Error).message}`);
+        }
       }
-      // Remove empty run directories.
+      // Remove empty run directories owned by the managed local backend.
       for (const artifact of deleted) {
+        if (!artifact.absolute_path.startsWith(this.managedStorage.root)) continue;
         const dir = resolve(artifact.absolute_path, '..');
-        if (dir.startsWith(this.storage.root)) {
+        if (dir.startsWith(this.managedStorage.root)) {
           await rm(dir, { recursive: false }).catch(() => undefined);
         }
       }
@@ -422,14 +697,322 @@ export class UdmtApp {
     return this.store.listStorageBackends();
   }
 
-  createStorageBackend(name: string, root: string): StorageBackendRecord {
-    const absolute = resolve(this.paths.artifactsDir, sanitizeName(name));
-    void root;
-    return this.store.createStorageBackend({
+  getStorageBackend(idOrName: string): StorageBackendRecord {
+    return this.store.requireStorageBackend(idOrName);
+  }
+
+  /** Instantiates a backend from its catalog record and vault secret. */
+  storageBackend(idOrName?: string | null): StorageBackend {
+    const record = this.store.requireStorageBackend(idOrName ?? null);
+    const secret = record.credential_ref ? this.secrets.load(record.credential_ref) : {};
+    return buildStorageBackend(this.paths, record, secret);
+  }
+
+  createStorageBackend(input: CreateStorageBackendInput): StorageBackendRecord {
+    if (!input.name?.trim()) throw new UdmtError('INVALID_INPUT', 'Storage backend name is required.');
+    if (!STORAGE_BACKEND_TYPES.includes(input.backend_type)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown storage backend type: ${input.backend_type}`);
+    }
+    const name = input.name.trim();
+    const config =
+      input.backend_type === 'local'
+        ? { ...(input.config ?? {}), root: resolve(String(input.config?.root ?? resolve(this.paths.artifactsDir, sanitizeName(name)))) }
+        : { ...(input.config ?? {}) };
+    const secret = input.secret ?? {};
+    // Validate before persisting so an invalid backend never lands in the catalog.
+    const candidate = buildStorageBackend(
+      this.paths,
+      {
+        id: 'pending',
+        name,
+        backend_type: input.backend_type,
+        config,
+        credential_ref: null,
+        is_default: false,
+        endpoint_hint: null,
+        last_tested_at: null,
+        last_test_status: null,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      },
+      secret,
+    );
+    const credentialRef = Object.keys(secret).length > 0 ? this.secrets.save(secret) : null;
+    const created = this.store.createStorageBackend({
       name,
-      backend_type: 'local',
-      config: { root: absolute },
+      backend_type: input.backend_type,
+      config,
+      credential_ref: credentialRef,
+      endpoint_hint: candidate.endpoint_hint,
+      is_default: input.is_default ?? false,
     });
+    this.store.audit('storage.created', { storage: created.name, type: created.backend_type });
+    return created;
+  }
+
+  updateStorageBackend(idOrName: string, patch: UpdateStorageBackendInput): StorageBackendRecord {
+    const existing = this.store.requireStorageBackend(idOrName);
+    if (existing.id === 'local-default' && patch.config) {
+      throw new UdmtError('PRECONDITION_FAILED', 'The built-in local backend location cannot be changed.');
+    }
+    const config = patch.config ?? existing.config;
+    const secret = patch.secret ? { ...this.secrets.load(existing.credential_ref), ...patch.secret } : this.secrets.load(existing.credential_ref);
+    const candidate = buildStorageBackend(this.paths, { ...existing, config }, secret);
+    const credentialRef = patch.secret || patch.config
+      ? this.secrets.replace(existing.credential_ref, secret)
+      : existing.credential_ref;
+    const updated = this.store.updateStorageBackend(existing.id, {
+      name: patch.name,
+      config,
+      credential_ref: credentialRef,
+      endpoint_hint: candidate.endpoint_hint,
+    });
+    this.store.audit('storage.updated', { storage: updated.name });
+    return updated;
+  }
+
+  deleteStorageBackend(idOrName: string): void {
+    const existing = this.store.requireStorageBackend(idOrName);
+    this.store.deleteStorageBackend(existing.id);
+    if (existing.credential_ref) this.secrets.delete(existing.credential_ref);
+    this.store.audit('storage.deleted', { storage: existing.name });
+  }
+
+  setDefaultStorageBackend(idOrName: string): StorageBackendRecord {
+    const updated = this.store.setDefaultStorageBackend(idOrName);
+    this.store.audit('storage.default', { storage: updated.name });
+    return updated;
+  }
+
+  async testStorageBackend(idOrName: string): Promise<StorageTestResult> {
+    const record = this.store.requireStorageBackend(idOrName);
+    const backend = this.storageBackend(record.id);
+    const result = await backend.test();
+    this.store.recordStorageTest(record.id, result.success ? 'success' : 'failed', result.endpoint_hint);
+    return { ...result, tested_at: nowIso() };
+  }
+
+  // ------------------------------------------------------------------ sync
+  listSyncPipelines(): SyncPipelineRecord[] {
+    return this.store.listSyncPipelines();
+  }
+
+  getSyncPipeline(idOrName: string): SyncPipelineRecord {
+    return this.store.requireSyncPipeline(idOrName);
+  }
+
+  createSyncPipeline(input: CreateSyncPipelineInput): SyncPipelineRecord {
+    const name = input.name?.trim();
+    if (!name) throw new UdmtError('INVALID_INPUT', 'Sync pipeline name is required.');
+    const source = this.store.requireConnection(input.source_connection_id);
+    const target = this.store.requireConnection(input.target_connection_id);
+    const sourceResource = input.source_resource?.trim();
+    const targetResource = input.target_resource?.trim();
+    if (!sourceResource) throw new UdmtError('INVALID_INPUT', 'Source resource is required.');
+    if (!targetResource) throw new UdmtError('INVALID_INPUT', 'Target resource is required.');
+    const loadMode = this.normalizeSyncLoadMode(input.load_mode ?? 'append');
+    const keyColumns = this.normalizeSyncKeys(loadMode, input.key_columns ?? [], input.mapping ?? []);
+    if (this.store.getSyncPipeline(name)) {
+      throw new UdmtError('ALREADY_EXISTS', `Sync pipeline "${name}" already exists.`);
+    }
+    const created = this.store.createSyncPipeline({
+      name,
+      source_connection_id: source.id,
+      target_connection_id: target.id,
+      source_resource: sourceResource,
+      target_resource: targetResource,
+      mapping: this.normalizeSyncMapping(input.mapping ?? []),
+      load_mode: loadMode,
+      key_columns: keyColumns,
+      options: this.normalizeSyncOptions(input.options ?? {}, loadMode),
+      enabled: input.enabled ?? true,
+    });
+    this.store.audit('sync.pipeline_created', { pipeline: created.name, mode: created.load_mode });
+    return created;
+  }
+
+  updateSyncPipeline(idOrName: string, patch: UpdateSyncPipelineInput): SyncPipelineRecord {
+    const existing = this.store.requireSyncPipeline(idOrName);
+    const source = patch.source_connection_id
+      ? this.store.requireConnection(patch.source_connection_id)
+      : this.store.requireConnection(existing.source_connection_id);
+    const target = patch.target_connection_id
+      ? this.store.requireConnection(patch.target_connection_id)
+      : this.store.requireConnection(existing.target_connection_id);
+    if (patch.name && patch.name.trim() !== existing.name) {
+      const duplicate = this.store.getSyncPipeline(patch.name.trim());
+      if (duplicate) throw new UdmtError('ALREADY_EXISTS', `Sync pipeline "${patch.name}" already exists.`);
+    }
+    const loadMode = patch.load_mode ? this.normalizeSyncLoadMode(patch.load_mode) : existing.load_mode;
+    const mapping = patch.mapping ? this.normalizeSyncMapping(patch.mapping) : existing.mapping;
+    const keyColumns = this.normalizeSyncKeys(
+      loadMode,
+      patch.key_columns ?? existing.key_columns,
+      mapping,
+    );
+    const updated = this.store.updateSyncPipeline(existing.id, {
+      name: patch.name?.trim() ?? existing.name,
+      source_connection_id: source.id,
+      target_connection_id: target.id,
+      source_resource: patch.source_resource?.trim() ?? existing.source_resource,
+      target_resource: patch.target_resource?.trim() ?? existing.target_resource,
+      mapping,
+      load_mode: loadMode,
+      key_columns: keyColumns,
+      options: patch.options ? this.normalizeSyncOptions({ ...existing.options, ...patch.options }, loadMode) : existing.options,
+      enabled: patch.enabled ?? existing.enabled,
+    });
+    this.store.audit('sync.pipeline_updated', { pipeline: updated.name });
+    return updated;
+  }
+
+  deleteSyncPipeline(idOrName: string): void {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    const active = this.store
+      .listRuns({ limit: 500 })
+      .filter((run) => !isTerminal(run.status) && run.operation_type === 'sync')
+      .some((run) => (run.config as { pipeline_id?: string }).pipeline_id === pipeline.id);
+    if (active) throw new UdmtError('CONFLICT', 'Sync pipeline has an active run. Cancel or wait for it to finish first.');
+    this.store.deleteSyncPipeline(pipeline.id);
+    this.store.audit('sync.pipeline_deleted', { pipeline: pipeline.name });
+  }
+
+  syncState(idOrName: string): SyncStateRecord | null {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    return this.store.getSyncState(pipeline.id) ?? null;
+  }
+
+  /** Clears the checkpoint/watermark so the next run replays fully (roadmap 21 Phase 8 replay). */
+  resetSyncState(idOrName: string): SyncStateRecord | null {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    this.store.deleteSyncState(pipeline.id);
+    this.store.audit('sync.checkpoint_reset', { pipeline: pipeline.name });
+    return null;
+  }
+
+  syncErrors(runIdOrPrefix: string, limit = 200): SyncRunError[] {
+    const run = this.store.resolveRun(runIdOrPrefix);
+    return this.store.listSyncErrors(run.id, limit);
+  }
+
+  runSync(request: SyncRequest) {
+    return this.engine.sync(request);
+  }
+
+  /**
+   * Dry-run preflight used by the UI/API before the first real run. Samples a
+   * bounded number of rows so a broken mapping never touches the target.
+   */
+  validateSyncPipeline(idOrName: string, options: { limit?: number; batch_size?: number } = {}) {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    return this.engine.sync({
+      pipeline_id: pipeline.id,
+      dry_run: true,
+      limit: Math.min(Math.max(options.limit ?? 100, 1), 5000),
+      ...(options.batch_size ? { batch_size: options.batch_size } : {}),
+    });
+  }
+
+  createSyncJob(input: {
+    name: string;
+    pipeline_id: string;
+    dry_run?: boolean;
+    limit?: number;
+    batch_size?: number;
+    on_error?: 'fail' | 'skip';
+    confirm?: string;
+    schedule?: ScheduleInput;
+  }): { job: JobRecord; schedule: ScheduleRecord | null } {
+    const pipeline = this.store.requireSyncPipeline(input.pipeline_id);
+    if (!input.name?.trim()) throw new UdmtError('INVALID_INPUT', 'Job name is required.');
+    const job = this.store.createJob({
+      name: input.name.trim(),
+      operation_type: 'sync',
+      source_connection_id: pipeline.source_connection_id,
+      target_connection_id: pipeline.target_connection_id,
+      storage_backend_id: null,
+      config: {
+        pipeline_id: pipeline.id,
+        ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
+        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        ...(input.batch_size !== undefined ? { batch_size: input.batch_size } : {}),
+        ...(input.on_error !== undefined ? { on_error: input.on_error } : {}),
+        ...(input.confirm !== undefined ? { confirm: input.confirm } : {}),
+      },
+    });
+    const schedule = input.schedule ? this.addSchedule(job.id, input.schedule) : null;
+    return { job, schedule };
+  }
+
+  private normalizeSyncLoadMode(mode: SyncLoadMode): SyncLoadMode {
+    if (!SYNC_LOAD_MODES.includes(mode)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown sync load mode: ${String(mode)}`);
+    }
+    return mode === 'replace_resource' ? 'truncate_and_load' : mode;
+  }
+
+  private normalizeSyncMapping(mapping: SyncFieldMapping[]): SyncFieldMapping[] {
+    const seen = new Set<string>();
+    for (const entry of mapping) {
+      const source = entry.source?.trim();
+      const target = (entry.target ?? entry.source)?.trim();
+      if (!source || !target) {
+        throw new UdmtError('INVALID_INPUT', 'Every mapping entry needs a source and target field.');
+      }
+      if (seen.has(target)) {
+        throw new UdmtError('INVALID_INPUT', `Two mapping entries write the same target field "${target}".`);
+      }
+      seen.add(target);
+      if (entry.mask && !['email', 'full', 'last4'].includes(entry.mask)) {
+        throw new UdmtError('INVALID_INPUT', `Unknown mask "${String(entry.mask)}".`);
+      }
+    }
+    return mapping.map((entry) => ({ ...entry, source: entry.source.trim(), target: (entry.target ?? entry.source).trim() }));
+  }
+
+  private normalizeSyncKeys(mode: SyncLoadMode, keyColumns: string[], mapping: SyncFieldMapping[]): string[] {
+    const keys = [...new Set(keyColumns.map((key) => key.trim()).filter(Boolean))];
+    if (mode === 'upsert' && keys.length === 0) {
+      throw new UdmtError('INVALID_INPUT', 'Sync mode upsert requires at least one key column.');
+    }
+    if (keys.length > 0 && mapping.length > 0) {
+      const targets = new Set(mapping.map((entry) => (entry.target ?? entry.source).trim()));
+      const invalid = keys.filter((key) => !targets.has(key));
+      if (invalid.length > 0) {
+        throw new UdmtError('INVALID_INPUT', `Key columns are not mapped to the target: ${invalid.join(', ')}`);
+      }
+    }
+    return keys;
+  }
+
+  private normalizeSyncOptions(options: SyncOptions, loadMode: SyncLoadMode): SyncOptions {
+    if (options.batch_size !== undefined && (!Number.isInteger(options.batch_size) || options.batch_size < 1 || options.batch_size > 5000)) {
+      throw new UdmtError('INVALID_INPUT', 'Sync batch_size must be between 1 and 5000.');
+    }
+    if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1)) {
+      throw new UdmtError('INVALID_INPUT', 'Sync limit must be a positive integer.');
+    }
+    if (options.filter && !options.filter.column) {
+      throw new UdmtError('INVALID_INPUT', 'Sync filter needs a column.');
+    }
+    if (options.filter?.operator === 'in' && !Array.isArray(options.filter.value)) {
+      throw new UdmtError('INVALID_INPUT', 'Sync filter operator "in" needs an array value.');
+    }
+    if (options.incremental) {
+      if (!options.incremental.column?.trim()) {
+        throw new UdmtError('INVALID_INPUT', 'Incremental sync needs a watermark column.');
+      }
+      if (loadMode === 'truncate_and_load' || loadMode === 'replace_resource') {
+        throw new UdmtError('INVALID_INPUT', 'Incremental sync cannot be combined with a destructive load mode.');
+      }
+    }
+    if (options.conflict_policy !== undefined && !SYNC_CONFLICT_POLICIES.includes(options.conflict_policy as SyncConflictPolicy)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown conflict_policy: ${String(options.conflict_policy)}`);
+    }
+    if (options.schema_evolution !== undefined && !SYNC_SCHEMA_EVOLUTION.includes(options.schema_evolution as SyncSchemaEvolution)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown schema_evolution: ${String(options.schema_evolution)}`);
+    }
+    return options;
   }
 
   // ------------------------------------------------------------------ jobs & schedules
@@ -441,7 +1024,7 @@ export class UdmtApp {
     name: string;
     connection_id: string;
     resource: string;
-    format: 'jsonl' | 'csv' | 'json';
+    format: 'jsonl' | 'csv' | 'json' | 'xml' | 'xlsx';
     compression?: 'none' | 'gzip';
     output_dir?: string;
     batch_size?: number;
@@ -472,7 +1055,7 @@ export class UdmtApp {
     connection_id: string;
     resource: string;
     source_path: string;
-    format?: 'jsonl' | 'csv' | 'json';
+    format?: 'jsonl' | 'csv' | 'json' | 'xml' | 'xlsx';
     mode: 'append' | 'upsert' | 'truncate_and_load';
     key_columns?: string[];
     confirm?: string;
@@ -603,6 +1186,10 @@ function isTerminal(status: OperationRun['status']): boolean {
   return ['completed', 'completed_with_warnings', 'failed', 'cancelled', 'interrupted'].includes(status);
 }
 
+function sanitizePluginLine(line: string): string {
+  return sanitizeErrorMessage(line).slice(0, 500);
+}
+
 /**
  * Accepts full connection URLs (including a password) for convenience and moves
  * the credential into the secret vault so it never lands in SQLite.
@@ -636,6 +1223,22 @@ export function normalizeInlineSecret(
     if (providerId === 'postgresql' && typeof nextConfig.connection_string === 'string') {
       return normalizeInlineSecret(providerId, { ...nextConfig, url: nextConfig.connection_string }, nextSecret);
     }
+    if (providerId === 'rest') {
+      // REST secrets can only be supplied at creation/inline time; they are moved before
+      // validation so they never reach the stored config.
+      for (const [inlineKey, secretKey] of [
+        ['bearer_token', 'token'],
+        ['api_key', 'api_key'],
+        ['user', 'username'],
+        ['basic_password', 'password'],
+      ] as const) {
+        if (nextConfig[inlineKey] !== undefined && nextSecret[secretKey] === undefined) {
+          nextSecret[secretKey] = nextConfig[inlineKey];
+          delete nextConfig[inlineKey];
+        }
+      }
+    }
+
   } catch (error) {
     throw new UdmtError('INVALID_CONFIG', `Could not parse the connection URL: ${(error as Error).message}`, {
       cause: error,

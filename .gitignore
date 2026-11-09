@@ -3,6 +3,7 @@ dist/
 .nuxt/
 .output/
 data/
+artifacts/
 *.log
 src-tauri/runtime/
 src-tauri/target/

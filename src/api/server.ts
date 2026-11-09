@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { UdmtError, toUdmtError } from '../core/errors.js';
 import type { UdmtApp } from '../core/service.js';
 import { nowIso } from '../core/utils.js';
-import type { ExportRequest, ImportRequest } from '../core/types.js';
+import type { ExportRequest, ImportRequest, PluginPermission, SyncRequest } from '../core/types.js';
 
 export interface ApiServerHandle {
   url: string;
@@ -239,6 +239,98 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
       return sendJson(res, 200, app.cancelRun(app.getRun(decodeURIComponent(cancelMatch[1]!)).id));
     }
 
+    const runErrorsMatch = /^\/api\/runs\/([^/]+)\/errors$/.exec(path);
+    if (runErrorsMatch && method === 'GET') {
+      return sendJson(res, 200, app.syncErrors(decodeURIComponent(runErrorsMatch[1]!), Number(parsed.searchParams.get('limit') ?? 200)));
+    }
+
+    if (path === '/api/sync/pipelines' && method === 'GET') {
+      return sendJson(res, 200, app.listSyncPipelines());
+    }
+    if (path === '/api/sync/pipelines' && method === 'POST') {
+      const body = await readJson(req);
+      return sendJson(res, 201, app.createSyncPipeline(body as never));
+    }
+
+    const syncPipelineMatch = /^\/api\/sync\/pipelines\/([^/]+)$/.exec(path);
+    if (syncPipelineMatch && method === 'GET') {
+      const pipeline = app.getSyncPipeline(decodeURIComponent(syncPipelineMatch[1]!));
+      return sendJson(res, 200, { pipeline, state: app.syncState(pipeline.id) });
+    }
+    if (syncPipelineMatch && method === 'PATCH') {
+      const body = await readJson(req);
+      return sendJson(res, 200, app.updateSyncPipeline(decodeURIComponent(syncPipelineMatch[1]!), body as never));
+    }
+    if (syncPipelineMatch && method === 'DELETE') {
+      app.deleteSyncPipeline(decodeURIComponent(syncPipelineMatch[1]!));
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const syncRunMatch = /^\/api\/sync\/pipelines\/([^/]+)\/run$/.exec(path);
+    if (syncRunMatch && method === 'POST') {
+      const body = (await readJson(req)) as Omit<SyncRequest, 'pipeline_id'>;
+      const pipeline = app.getSyncPipeline(decodeURIComponent(syncRunMatch[1]!));
+      const started = app.engine.startSync({ ...body, pipeline_id: pipeline.id });
+      void started.done;
+      return sendJson(res, 202, started.run);
+    }
+
+    const syncValidateMatch = /^\/api\/sync\/pipelines\/([^/]+)\/validate$/.exec(path);
+    if (syncValidateMatch && method === 'POST') {
+      const body = (await readJson(req)) as { limit?: number; batch_size?: number };
+      const result = await app.validateSyncPipeline(decodeURIComponent(syncValidateMatch[1]!), body ?? {});
+      return sendJson(res, 200, result.run);
+    }
+
+    const syncStateMatch = /^\/api\/sync\/pipelines\/([^/]+)\/state$/.exec(path);
+    if (syncStateMatch && method === 'GET') {
+      return sendJson(res, 200, app.syncState(decodeURIComponent(syncStateMatch[1]!)));
+    }
+
+    const syncResetMatch = /^\/api\/sync\/pipelines\/([^/]+)\/reset$/.exec(path);
+    if (syncResetMatch && method === 'POST') {
+      return sendJson(res, 200, app.resetSyncState(decodeURIComponent(syncResetMatch[1]!)));
+    }
+
+    if (path === '/api/plugins' && method === 'GET') {
+      return sendJson(res, 200, app.listPlugins());
+    }
+    if (path === '/api/plugins' && method === 'POST') {
+      const body = await readJson(req);
+      return sendJson(res, 201, app.installPlugin(body as never));
+    }
+
+    const pluginMatch = /^\/api\/plugins\/([^/]+)$/.exec(path);
+    if (pluginMatch && method === 'GET') {
+      const id = decodeURIComponent(pluginMatch[1]!);
+      return sendJson(res, 200, { plugin: app.getPlugin(id), diagnostics: app.pluginDiagnostics(id) });
+    }
+    if (pluginMatch && method === 'PATCH') {
+      const id = decodeURIComponent(pluginMatch[1]!);
+      const body = (await readJson(req)) as {
+        enabled?: boolean;
+        trusted?: boolean;
+        granted_permissions?: PluginPermission[];
+      };
+      let record = app.getPlugin(id);
+      if (body.trusted !== undefined) record = app.setPluginTrust(id, { trusted: body.trusted, ...(body.granted_permissions ? { granted_permissions: body.granted_permissions } : {}) });
+      if (body.enabled !== undefined) record = app.setPluginEnabled(id, body.enabled);
+      return sendJson(res, 200, record);
+    }
+    if (pluginMatch && method === 'DELETE') {
+      app.removePlugin(decodeURIComponent(pluginMatch[1]!));
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const pluginUpdateMatch = /^\/api\/plugins\/([^/]+)\/update$/.exec(path);
+    if (pluginUpdateMatch && method === 'POST') {
+      return sendJson(res, 200, app.updatePlugin(decodeURIComponent(pluginUpdateMatch[1]!)));
+    }
+    const pluginTestMatch = /^\/api\/plugins\/([^/]+)\/test$/.exec(path);
+    if (pluginTestMatch && method === 'POST') {
+      return sendJson(res, 200, await app.testPlugin(decodeURIComponent(pluginTestMatch[1]!)));
+    }
+
     if (path === '/api/artifacts' && method === 'GET') {
       return sendJson(res, 200, app.listArtifacts({ limit: Number(parsed.searchParams.get('limit') ?? 100) }));
     }
@@ -248,7 +340,7 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
       return sendJson(res, 200, app.getArtifact(decodeURIComponent(artifactMatch[1]!)));
     }
     if (artifactMatch && method === 'DELETE') {
-      app.deleteArtifact(decodeURIComponent(artifactMatch[1]!));
+      await app.deleteArtifact(decodeURIComponent(artifactMatch[1]!));
       return sendJson(res, 200, { deleted: true });
     }
 
@@ -312,6 +404,37 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
 
     if (path === '/api/storage' && method === 'GET') {
       return sendJson(res, 200, { backends: app.listStorageBackends(), root: app.paths.artifactsDir });
+    }
+
+    if (path === '/api/storage/backends' && method === 'GET') {
+      return sendJson(res, 200, app.listStorageBackends());
+    }
+    if (path === '/api/storage/backends' && method === 'POST') {
+      const body = await readJson(req);
+      return sendJson(res, 201, app.createStorageBackend(body as never));
+    }
+
+    const storageMatch = /^\/api\/storage\/backends\/([^/]+)$/.exec(path);
+    if (storageMatch && method === 'GET') {
+      return sendJson(res, 200, app.getStorageBackend(decodeURIComponent(storageMatch[1]!)));
+    }
+    if (storageMatch && method === 'PATCH') {
+      const body = await readJson(req);
+      return sendJson(res, 200, app.updateStorageBackend(decodeURIComponent(storageMatch[1]!), body as never));
+    }
+    if (storageMatch && method === 'DELETE') {
+      app.deleteStorageBackend(decodeURIComponent(storageMatch[1]!));
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const storageTestMatch = /^\/api\/storage\/backends\/([^/]+)\/test$/.exec(path);
+    if (storageTestMatch && method === 'POST') {
+      return sendJson(res, 200, await app.testStorageBackend(decodeURIComponent(storageTestMatch[1]!)));
+    }
+
+    const storageDefaultMatch = /^\/api\/storage\/backends\/([^/]+)\/default$/.exec(path);
+    if (storageDefaultMatch && method === 'POST') {
+      return sendJson(res, 200, app.setDefaultStorageBackend(decodeURIComponent(storageDefaultMatch[1]!)));
     }
 
     return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `Unknown endpoint: ${method} ${path}` } });

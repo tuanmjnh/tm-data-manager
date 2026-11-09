@@ -1,6 +1,8 @@
 # Testing strategy
 
-Run with `npm test` (vitest). Current suite: **43 tests**, ~13 s, no external services required.
+Run with `pnpm test` (vitest). Current suite: **89 tests**, ~19 s, no external services required (the
+REST and S3 integration tests start their own local HTTP servers; the plugin tests spawn local child
+processes).
 
 ## Unit
 
@@ -11,6 +13,9 @@ Run with `npm test` (vitest). Current suite: **43 tests**, ~13 s, no external se
 | `tests/unit/formats.test.ts` | JSONL/CSV/JSON round trips, gzip, CSV escaping of quotes/commas, nested JSON, malformed JSON rejection, type coercion |
 | `tests/unit/paths.test.ts` | path traversal/symlink-escape rejection, NUL bytes, unsafe segments, log/endpoint redaction |
 | `tests/unit/sqlite-provider.test.ts` | create table with PK, streaming read, upsert idempotency, not-found error, cancellation |
+| `tests/unit/storage-signing.test.ts` | S3 SigV4 canonical request, locator parsing, config/prefix validation |
+| `tests/unit/sync-pipeline.test.ts` | mapping defaults, unknown-source/duplicate-target rejection, transform order, lossy-cast rejection, masks, dotted paths, all filter operators |
+| `tests/unit/formats-xml-xlsx.test.ts` | XML typed/nested/null/escaped round trip, generic XML parsing, XLSX write+read with coercion, XLSX gzip rejection |
 
 ## Integration
 
@@ -28,6 +33,25 @@ Run with `npm test` (vitest). Current suite: **43 tests**, ~13 s, no external se
 - Retention preview never deletes a pinned artifact.
 - Editing a connection keeps the stored secret, can rename, and rotates the password only when one
   is supplied.
+
+`tests/integration/sync.test.ts` — SQLite→SQLite sync pipelines: append, mapping/trim/cast/mask/filter,
+upsert idempotency, `truncate_and_load` confirmation, `on_error=skip`/`fail`, dry run, key validation.
+
+`tests/integration/storage-s3.test.ts` — a local HTTP endpoint speaking the S3 wire format: publish,
+list, download, delete, export→S3→catalog→import round trip, delete protection.
+
+`tests/integration/rest-connector.test.ts` — a local JSON HTTP API: config secrecy, authenticated
+paginated connection test, 401 without leaking the secret, API key in a header, missing-credential
+rejection, and REST → artifact → SQLite import over multiple pages.
+
+`tests/integration/incremental-sync.test.ts` — watermark incremental sync on real SQLite files: only
+rows past the watermark are read on the next run, the watermark advances, checkpoint reset replays,
+`conflict_policy: ignore` skips existing keys, `schema_evolution: add_columns` adds a missing column,
+and incremental + truncate is rejected.
+
+`tests/integration/plugin-host.test.ts` — installs `plugins/sample-jsonapi`, checks trust gating and
+permission subsets, rejects bad/future manifests, runs handshake + discovery + export + import through
+the real engine, proves crash isolation with `tests/fixtures/plugins/crash`, and checks remove/unregister.
 
 `tests/integration/migrations.test.ts` — fresh DB is versioned and idempotent; a legacy
 `connections`/`operation_logs` schema is migrated without losing rows, mapped to

@@ -33,6 +33,12 @@ export interface ReadRequest {
   batchSize: number;
   /** Continue after this key tuple (checkpoint for resumable exports). */
   offset?: number;
+  /**
+   * Watermark read: return only rows whose `column` is strictly greater than
+   * `after`, ordered by that column. Only used when the provider declares the
+   * `incremental_read` capability; `after === null` means "read everything".
+   */
+  incremental?: { column: string; after: unknown };
 }
 
 export interface WriteRequest {
@@ -41,6 +47,10 @@ export interface WriteRequest {
   mode: 'append' | 'upsert' | 'truncate_and_load';
   keyColumns?: string[];
   createResource?: boolean;
+  /** How an upsert handles an existing key. Defaults to `overwrite`. */
+  onConflict?: 'overwrite' | 'ignore';
+  /** `add_columns` lets a provider add missing target columns instead of ignoring them. */
+  schemaEvolution?: 'ignore' | 'add_columns';
 }
 
 export interface WriteResult {
@@ -123,6 +133,7 @@ export const CAPABILITY_LABELS: Record<CapabilityId, string> = {
   transactions: 'Transactions',
   consistent_snapshot: 'Consistent snapshot',
   query: 'Query',
+  incremental_read: 'Incremental/watermark read',
   native_backup: 'Native backup',
   native_restore: 'Native restore',
 };

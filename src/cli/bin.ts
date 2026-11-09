@@ -6,7 +6,7 @@ import { UdmtError, toUdmtError } from '../core/errors.js';
 import { APP_VERSION } from '../core/utils.js';
 import { WorkerRuntime } from '../core/worker.js';
 import { startApiServer } from '../api/server.js';
-import type { ExportFormat, ImportRequest, OperationRun } from '../core/types.js';
+import type { ExportFormat, ImportRequest, OperationRun, PluginPermission, SyncFieldMapping, SyncLoadMode, SyncOptions } from '../core/types.js';
 import {
   EXIT,
   RESET,
@@ -143,6 +143,8 @@ function connectionConfigFromFlags(provider: string, options: Record<string, unk
     case 'sqlite':
       if (!options.path) throw new UdmtError('INVALID_INPUT', 'SQLite needs --path <file> or --config <json>.');
       return { path: String(options.path), read_only: options.readOnly !== false };
+    case 'rest':
+      throw new UdmtError('INVALID_INPUT', 'REST needs --config <json> with base_url; see docs/provider-contract/rest-connector.md.');
     case 'mongodb':
       if (!options.uri) throw new UdmtError('INVALID_INPUT', 'MongoDB needs --uri <connection string>.');
       return {
@@ -269,16 +271,26 @@ connection
   .option('--user <name>')
   .option('--password <password>', 'prefer --password-stdin to keep it out of shell history')
   .option('--password-stdin', 'read the password from stdin')
+  .option('--token <token>', 'REST bearer token (stored in the vault)')
+  .option('--api-key <key>', 'REST API key (stored in the vault)')
   .option('--ssl <mode>', 'require|verify-full|disable')
   .option('--url <url>', 'postgres/mysql connection URL (password is moved to the vault)')
   .action(async (options: Record<string, unknown>) => {
     await main(async () => {
       const password = await resolvePassword(options);
       await withApp((app) => {
-        const config = connectionConfigFromFlags(String(options.provider), options);
+        const provider = String(options.provider);
+        const config: Record<string, unknown> = connectionConfigFromFlags(provider, options);
+        // REST credentials are passed inline so normalizeInlineSecret moves them to the vault.
+        if (provider === 'rest') {
+          if (typeof options.token === 'string' && options.token) config.bearer_token = options.token;
+          else if (typeof options.apiKey === 'string' && options.apiKey) config.api_key = options.apiKey;
+          else if (password) config.bearer_token = password;
+          if (typeof options.user === 'string' && options.user && !config.username) config.username = options.user;
+        }
         const created = app.createConnection({
           name: String(options.name),
-          provider_id: String(options.provider),
+          provider_id: provider,
           service_profile: (options.profile as string | undefined) ?? null,
           config,
           secret: password ? { password } : {},
@@ -431,7 +443,7 @@ program
   .description('Export a resource to CSV/JSONL/JSON')
   .requiredOption('--conn <connection>')
   .requiredOption('--resource <resource>', 'e.g. main.users or app.customers')
-  .addOption(new Option('--format <format>', 'output format').choices(['jsonl', 'csv', 'json']).default('jsonl'))
+  .addOption(new Option('--format <format>', 'output format').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']).default('jsonl'))
   .addOption(new Option('--compression <mode>', 'none|gzip').choices(['none', 'gzip']).default('none'))
   .option('--out <directory>', 'output directory (defaults to the managed artifacts root)')
   .option('--limit <n>', 'maximum rows to export', (value) => Number(value))
@@ -473,7 +485,7 @@ program
   .requiredOption('--resource <resource>', 'target resource, e.g. main.users')
   .option('--from <path>', 'source CSV/JSONL/JSON file')
   .option('--artifact <id>', 'source artifact id')
-  .addOption(new Option('--format <format>', 'source format when importing a file').choices(['jsonl', 'csv', 'json']))
+  .addOption(new Option('--format <format>', 'source format when importing a file').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']))
   .addOption(new Option('--mode <mode>', 'load mode').choices(['append', 'upsert', 'truncate_and_load']).default('append'))
   .option('--key-columns <list>', 'upsert key columns (comma separated)')
   .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
@@ -691,11 +703,7 @@ artifact
   .action(async (artifactId: string) => {
     await main(async () => {
       await withApp(async (app) => {
-        const found = app.getArtifact(artifactId);
-        app.deleteArtifact(artifactId);
-        const { rm } = await import('node:fs/promises');
-        await rm(found.absolute_path, { force: true });
-        await rm(`${found.absolute_path}.manifest.json`, { force: true });
+        await app.deleteArtifact(artifactId);
         process.stdout.write(`Deleted artifact ${artifactId}.\n`);
       });
     });
@@ -727,6 +735,556 @@ artifact
     });
   });
 
+// ------------------------------------------------------------------ storage
+const storage = program.command('storage').description('Manage artifact storage backends');
+
+storage
+  .command('list')
+  .description('List storage backends')
+  .action(async () => {
+    await withApp((app) => {
+      const rows = app.listStorageBackends();
+      if (globalOptions().json) return printJson(rows);
+      printTable(
+        rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          type: row.backend_type,
+          default: row.is_default,
+          endpoint: row.endpoint_hint ?? '—',
+          last_test: row.last_test_status ? `${row.last_test_status} @ ${row.last_tested_at}` : 'never',
+        })),
+        ['id', 'name', 'type', 'default', 'endpoint', 'last_test'],
+      );
+    });
+  });
+
+storage
+  .command('inspect')
+  .argument('<backend>')
+  .description('Show a storage backend (secrets are never printed)')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const row = app.getStorageBackend(idOrName);
+      if (globalOptions().json) return printJson(row);
+      process.stdout.write(`${row.name} (${row.id}) — ${row.backend_type}\n`);
+      process.stdout.write(`default:  ${row.is_default ? 'yes' : 'no'}\n`);
+      process.stdout.write(`endpoint: ${row.endpoint_hint ?? '—'}\n`);
+      process.stdout.write(`credential: ${row.credential_ref ? 'stored encrypted' : 'none'}\n`);
+      process.stdout.write(`last test:  ${row.last_test_status ?? 'never'} ${row.last_tested_at ?? ''}\n`);
+      process.stdout.write(`config:   ${JSON.stringify(row.config, null, 2)}\n`);
+    });
+  });
+
+storage
+  .command('add')
+  .description('Add a local or S3-compatible storage backend')
+  .requiredOption('--name <name>')
+  .addOption(new Option('--type <type>', 'backend type').choices(['local', 's3']).default('local'))
+  .option('--root <dir>', 'local backend root (managed under the artifacts directory by default)')
+  .option('--endpoint <url>', 'S3 endpoint URL')
+  .option('--region <region>', 'S3 region', 'auto')
+  .option('--bucket <bucket>')
+  .option('--prefix <prefix>')
+  .option('--access-key-id <id>')
+  .option('--secret-access-key <key>', 'prefer --secret-access-key-stdin')
+  .option('--secret-access-key-stdin', 'read the S3 secret access key from stdin')
+  .option('--session-token <token>')
+  .option('--virtual-host', 'use virtual-hosted bucket addressing instead of path-style')
+  .option('--default', 'make this the default artifact backend')
+  .action(async (options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const type = String(options.type) as 'local' | 's3';
+        let secret: Record<string, unknown> = {};
+        if (type === 's3') {
+          if (!options.endpoint || !options.bucket) {
+            throw new UdmtError('INVALID_INPUT', 'S3 storage needs --endpoint and --bucket.');
+          }
+          const secretKey = options.secretAccessKeyStdin
+            ? (await readStdin()) || undefined
+            : (options.secretAccessKey as string | undefined);
+          if (!options.accessKeyId || !secretKey) {
+            throw new UdmtError('INVALID_INPUT', 'S3 storage needs --access-key-id and a secret access key.');
+          }
+          secret = {
+            access_key_id: String(options.accessKeyId),
+            secret_access_key: String(secretKey),
+            ...(options.sessionToken ? { session_token: String(options.sessionToken) } : {}),
+          };
+        }
+        const created = app.createStorageBackend({
+          name: String(options.name),
+          backend_type: type,
+          config:
+            type === 's3'
+              ? {
+                  endpoint: String(options.endpoint),
+                  region: String(options.region ?? 'auto'),
+                  bucket: String(options.bucket),
+                  ...(options.prefix ? { prefix: String(options.prefix) } : {}),
+                  force_path_style: !options.virtualHost,
+                }
+              : options.root
+                ? { root: String(options.root) }
+                : {},
+          secret,
+          is_default: Boolean(options.default),
+        });
+        if (globalOptions().json) return printJson(created);
+        process.stdout.write(`Created storage backend "${created.name}" (${created.backend_type}).\n`);
+        process.stdout.write(`Endpoint: ${created.endpoint_hint ?? '—'}\n`);
+      });
+    });
+  });
+
+storage
+  .command('test')
+  .argument('<backend>')
+  .description('Probe read/write access for a storage backend')
+  .action(async (idOrName: string) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const result = await app.testStorageBackend(idOrName);
+        if (globalOptions().json) return printJson(result);
+        process.stdout.write(`${result.success ? 'OK' : 'FAILED'} ${idOrName} (${result.latency_ms}ms)\n`);
+        for (const line of result.diagnostics) process.stdout.write(`  - ${line}\n`);
+        if (!result.success) throw new UdmtError('STORAGE_ERROR', result.diagnostics[0] ?? 'Storage test failed');
+      });
+    });
+  });
+
+storage
+  .command('default')
+  .argument('<backend>')
+  .description('Choose the default artifact backend')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const updated = app.setDefaultStorageBackend(idOrName);
+      process.stdout.write(`Default storage backend is now "${updated.name}".\n`);
+    });
+  });
+
+storage
+  .command('remove')
+  .argument('<backend>')
+  .description('Remove a storage backend (must be empty and not the default)')
+  .action(async (idOrName: string) => {
+    await main(async () => {
+      await withApp((app) => {
+        app.deleteStorageBackend(idOrName);
+        process.stdout.write(`Removed storage backend "${idOrName}".\n`);
+      });
+    });
+  });
+
+// ------------------------------------------------------------------ sync
+const sync = program.command('sync').description('Manage and run source→target sync pipelines');
+const syncPipeline = sync.command('pipeline').description('Manage sync pipeline definitions');
+
+function parseJsonOption<T>(value: unknown, label: string): T | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  try {
+    return JSON.parse(String(value)) as T;
+  } catch {
+    throw new UdmtError('INVALID_INPUT', `${label} must be valid JSON.`);
+  }
+}
+
+function printSyncRun(run: OperationRun): void {
+  if (globalOptions().json) return printJson(run);
+  const result = run.result ?? {};
+  process.stdout.write(`${result.dry_run ? 'Sync dry run finished — nothing was written.' : 'Sync completed.'}\n`);
+  process.stdout.write(`  run:      ${run.id}\n`);
+  process.stdout.write(`  status:   ${run.status}\n`);
+  if (result.dry_run) {
+    process.stdout.write(`  sampled:  ${result.rows_sampled ?? 0}\n`);
+    process.stdout.write(`  matched:  ${result.rows_matched ?? 0}\n`);
+  } else {
+    process.stdout.write(`  read:     ${result.rows_read ?? 0}\n`);
+    process.stdout.write(`  filtered: ${result.rows_filtered ?? 0}\n`);
+    process.stdout.write(`  written:  ${result.rows_written ?? 0}\n`);
+    process.stdout.write(`  skipped:  ${result.rows_skipped ?? 0}\n`);
+  }
+  process.stdout.write(`  errors:   ${result.errors ?? 0}\n`);
+  for (const warning of ((result.warnings as string[] | undefined) ?? []).slice(0, 20)) {
+    process.stdout.write(`  warning:  ${warning}\n`);
+  }
+}
+
+syncPipeline
+  .command('list')
+  .description('List sync pipelines')
+  .action(async () => {
+    await withApp((app) => {
+      const rows = app.listSyncPipelines();
+      if (globalOptions().json) return printJson(rows);
+      printTable(
+        rows.map((row) => ({
+          id: row.id.slice(0, 8),
+          name: row.name,
+          mode: row.load_mode,
+          source: row.source_resource,
+          target: row.target_resource,
+          enabled: row.enabled,
+          updated: row.updated_at,
+        })),
+        ['id', 'name', 'mode', 'source', 'target', 'enabled', 'updated'],
+      );
+    });
+  });
+
+syncPipeline
+  .command('inspect')
+  .argument('<pipeline>')
+  .description('Show a sync pipeline definition and its last state')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const row = app.getSyncPipeline(idOrName);
+      const state = app.syncState(row.id);
+      if (globalOptions().json) return printJson({ pipeline: row, state });
+      process.stdout.write(`${row.name} (${row.id}) — ${row.load_mode}\n`);
+      process.stdout.write(`source:  ${row.source_connection_id}.${row.source_resource}\n`);
+      process.stdout.write(`target:  ${row.target_connection_id}.${row.target_resource}\n`);
+      process.stdout.write(`keys:    ${row.key_columns.join(', ') || '—'}\n`);
+      process.stdout.write(`enabled: ${row.enabled ? 'yes' : 'no'}\n`);
+      process.stdout.write(`mapping: ${JSON.stringify(row.mapping, null, 2)}\n`);
+      process.stdout.write(`options: ${JSON.stringify(row.options, null, 2)}\n`);
+      if (state) {
+        process.stdout.write(`last run: ${state.last_status ?? '—'} @ ${state.last_run_at ?? '—'} (${state.rows_synced} rows total)\n`);
+      }
+    });
+  });
+
+function syncDefinitionFromFlags(options: Record<string, unknown>) {
+  return {
+    ...(options.name ? { name: String(options.name) } : {}),
+    ...(options.sourceConn ? { source_connection_id: String(options.sourceConn) } : {}),
+    ...(options.targetConn ? { target_connection_id: String(options.targetConn) } : {}),
+    ...(options.sourceResource ? { source_resource: String(options.sourceResource) } : {}),
+    ...(options.targetResource ? { target_resource: String(options.targetResource) } : {}),
+    ...(options.mode ? { load_mode: String(options.mode) as SyncLoadMode } : {}),
+    ...(options.keyColumns ? { key_columns: parseKeyColumns(String(options.keyColumns)) } : {}),
+    ...(options.mapping ? { mapping: parseJsonOption<SyncFieldMapping[]>(options.mapping, '--mapping') } : {}),
+    ...(options.options ? { options: parseJsonOption<SyncOptions>(options.options, '--options') } : {}),
+    ...(options.disabled ? { enabled: false } : {}),
+  };
+}
+
+function addSyncDefinitionOptions(command: Command, required: boolean): Command {
+  const commandWithFlags = required
+    ? command
+        .requiredOption('--name <name>', 'pipeline name')
+        .requiredOption('--source-conn <connection>', 'source connection')
+        .requiredOption('--target-conn <connection>', 'target connection')
+        .requiredOption('--source-resource <resource>', 'source table/collection/file')
+        .requiredOption('--target-resource <resource>', 'target table/collection/file')
+    : command
+        .option('--name <name>', 'pipeline name')
+        .option('--source-conn <connection>', 'source connection')
+        .option('--target-conn <connection>', 'target connection')
+        .option('--source-resource <resource>', 'source table/collection/file')
+        .option('--target-resource <resource>', 'target table/collection/file');
+  return commandWithFlags
+    .addOption(
+      new Option('--mode <mode>', 'load mode').choices(['append', 'upsert', 'truncate_and_load', 'replace_resource']).default(required ? 'append' : undefined),
+    )
+    .option('--key-columns <list>', 'upsert key target columns (comma separated)')
+    .option('--mapping <json>', 'field mapping JSON array, e.g. [{"source":"id","target":"id"}]')
+    .option('--options <json>', 'options JSON object (filter, batch_size, on_error, retry, dry_run, create_resource, limit)')
+    .option('--disabled', 'create the pipeline disabled');
+}
+
+addSyncDefinitionOptions(
+  syncPipeline.command('create').description('Create a sync pipeline'),
+  true,
+).action(async (options: Record<string, unknown>) => {
+  await main(async () => {
+    await withApp((app) => {
+      const created = app.createSyncPipeline(syncDefinitionFromFlags(options) as never);
+      if (globalOptions().json) return printJson(created);
+      process.stdout.write(`Created sync pipeline "${created.name}" (${created.id}).\n`);
+    });
+  });
+});
+
+addSyncDefinitionOptions(
+  syncPipeline.command('update').argument('<pipeline>').description('Update a sync pipeline'),
+  false,
+).action(async (idOrName: string, options: Record<string, unknown>) => {
+  await main(async () => {
+    await withApp((app) => {
+      const patch = syncDefinitionFromFlags(options);
+      const updated = app.updateSyncPipeline(idOrName, patch);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Updated sync pipeline "${updated.name}".\n`);
+    });
+  });
+});
+
+syncPipeline
+  .command('remove')
+  .argument('<pipeline>')
+  .description('Delete a sync pipeline')
+  .action(async (idOrName: string) => {
+    await main(async () => {
+      await withApp((app) => {
+        app.deleteSyncPipeline(idOrName);
+        process.stdout.write(`Deleted sync pipeline ${idOrName}.\n`);
+      });
+    });
+  });
+
+sync
+  .command('run')
+  .argument('<pipeline>')
+  .description('Run a sync pipeline')
+  .option('--dry-run', 'validate and sample without writing')
+  .option('--limit <n>', 'maximum source rows', (value) => Number(value))
+  .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
+  .addOption(new Option('--on-error <mode>', 'row error handling').choices(['fail', 'skip']))
+  .option('--confirm <target_connection_name>', 'required for destructive or production targets')
+  .action(async (idOrName: string, options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const pipeline = app.getSyncPipeline(idOrName);
+        const started = app.engine.startSync({
+          pipeline_id: pipeline.id,
+          ...(options.dryRun ? { dry_run: true } : {}),
+          ...(options.limit ? { limit: Number(options.limit) } : {}),
+          ...(options.batchSize ? { batch_size: Number(options.batchSize) } : {}),
+          ...(options.onError ? { on_error: options.onError as 'fail' | 'skip' } : {}),
+          ...(options.confirm ? { confirm: String(options.confirm) } : {}),
+        });
+        const run = assertSuccess(await watchRun(app, started.run.id));
+        printSyncRun(run);
+      });
+    });
+  });
+
+sync
+  .command('validate')
+  .argument('<pipeline>')
+  .description('Dry-run a pipeline against a bounded sample')
+  .option('--limit <n>', 'rows to sample', (value) => Number(value), 100)
+  .action(async (idOrName: string, options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const { run } = await app.validateSyncPipeline(idOrName, { limit: Number(options.limit ?? 100) });
+        const finished = assertSuccess(run);
+        printSyncRun(finished);
+      });
+    });
+  });
+
+sync
+  .command('state')
+  .argument('<pipeline>')
+  .description('Show checkpoint state for a pipeline')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const state = app.syncState(idOrName);
+      if (globalOptions().json) return printJson(state);
+      if (!state) return process.stdout.write('No sync state yet.\n');
+      process.stdout.write(`pipeline: ${state.pipeline_id}\n`);
+      process.stdout.write(`last run: ${state.last_run_id ?? '—'} (${state.last_status ?? '—'})\n`);
+      process.stdout.write(`updated:  ${state.updated_at}\n`);
+      process.stdout.write(`rows:     ${state.rows_synced}\n`);
+      process.stdout.write(`checkpoint: ${JSON.stringify(state.checkpoint, null, 2)}\n`);
+    });
+  });
+
+sync
+  .command('reset')
+  .argument('<pipeline>')
+  .description('Clear the checkpoint/watermark so the next run replays fully')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      app.resetSyncState(idOrName);
+      process.stdout.write(`Cleared sync state for ${idOrName}. The next run reads from the beginning.\n`);
+    });
+  });
+
+sync
+  .command('errors')
+  .argument('<run>')
+  .description('Show persisted row errors for a sync run')
+  .option('--limit <n>', 'maximum rows', (value) => Number(value), 200)
+  .action(async (runId: string, options: Record<string, unknown>) => {
+    await withApp((app) => {
+      const rows = app.syncErrors(runId, Number(options.limit ?? 200));
+      if (globalOptions().json) return printJson(rows);
+      if (rows.length === 0) return process.stdout.write('No sync row errors recorded.\n');
+      printTable(
+        rows.map((row) => ({
+          row: row.row_index ?? '—',
+          batch: row.batch_index ?? '—',
+          code: row.code,
+          message: row.message,
+        })),
+        ['row', 'batch', 'code', 'message'],
+      );
+    });
+  });
+
+// ------------------------------------------------------------------ plugins
+const plugin = program.command('plugin').description('Manage external provider plugins');
+
+plugin
+  .command('list')
+  .description('List installed plugins')
+  .action(async () => {
+    await withApp((app) => {
+      const rows = app.listPlugins();
+      if (globalOptions().json) return printJson(rows);
+      if (rows.length === 0) return process.stdout.write('No plugins installed.\n');
+      printTable(
+        rows.map((row) => ({
+          id: row.id,
+          version: row.version,
+          status: row.status,
+          enabled: row.enabled,
+          trusted: row.trusted,
+          permissions: row.granted_permissions.join(',') || '—',
+          updated: row.updated_at,
+        })),
+        ['id', 'version', 'status', 'enabled', 'trusted', 'permissions', 'updated'],
+      );
+    });
+  });
+
+plugin
+  .command('inspect')
+  .argument('<plugin>')
+  .description('Show a plugin manifest, permissions and status')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const row = app.getPlugin(id);
+      if (globalOptions().json) return printJson(row);
+      process.stdout.write(`${row.name} (${row.id}) v${row.version} — ${row.status}\n`);
+      process.stdout.write(`path:          ${row.install_path}\n`);
+      process.stdout.write(`protocol:      ${row.protocol_version}\n`);
+      process.stdout.write(`enabled:       ${row.enabled ? 'yes' : 'no'}\n`);
+      process.stdout.write(`trusted:       ${row.trusted ? 'yes' : 'no'}\n`);
+      process.stdout.write(`requested:     ${row.requested_permissions.join(', ') || '—'}\n`);
+      process.stdout.write(`granted:       ${row.granted_permissions.join(', ') || '—'}\n`);
+      process.stdout.write(`capabilities:  ${row.manifest.provider.capabilities.join(', ')}\n`);
+      process.stdout.write(`runtime:       ${row.manifest.runtime.command} ${(row.manifest.runtime.args ?? []).join(' ')}\n`);
+      if (row.last_error) process.stdout.write(`last error:    ${row.last_error}\n`);
+    });
+  });
+
+plugin
+  .command('install')
+  .description('Install a plugin from a folder containing udmt-plugin.json')
+  .requiredOption('--path <dir>')
+  .option('--trust', 'grant every requested permission immediately')
+  .option('--enable', 'enable the plugin (requires trust)')
+  .action(async (options: Record<string, unknown>) => {
+    await withApp((app) => {
+      const installed = app.installPlugin({
+        path: String(options.path),
+        trusted: Boolean(options.trust),
+        enabled: Boolean(options.enable),
+      });
+      if (globalOptions().json) return printJson(installed);
+      process.stdout.write(`Installed plugin "${installed.id}" v${installed.version} (trusted: ${installed.trusted}).\n`);
+      if (!installed.trusted) {
+        process.stdout.write(`Review permissions with: udmt plugin inspect ${installed.id}\n`);
+        process.stdout.write(`Grant them with: udmt plugin trust ${installed.id}\n`);
+      }
+    });
+  });
+
+plugin
+  .command('update')
+  .argument('<plugin>')
+  .description('Re-read the manifest from the install folder')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.updatePlugin(id);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Updated plugin "${updated.id}" to v${updated.version}.\n`);
+    });
+  });
+
+plugin
+  .command('trust')
+  .argument('<plugin>')
+  .option('--permissions <list>', 'comma-separated subset of the requested permissions')
+  .description('Grant permissions and mark the plugin trusted')
+  .action(async (id: string, options: Record<string, unknown>) => {
+    await withApp((app) => {
+      const granted = typeof options.permissions === 'string' && options.permissions.trim()
+        ? (options.permissions.split(',').map((entry) => entry.trim()).filter(Boolean) as PluginPermission[])
+        : undefined;
+      const updated = app.setPluginTrust(id, { trusted: true, ...(granted ? { granted_permissions: granted } : {}) });
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Trusted plugin "${updated.id}" with permissions: ${updated.granted_permissions.join(', ') || '—'}\n`);
+    });
+  });
+
+plugin
+  .command('untrust')
+  .argument('<plugin>')
+  .description('Revoke trust and disable the plugin')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.setPluginTrust(id, { trusted: false });
+      app.setPluginEnabled(id, false);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Revoked trust for plugin "${id}".\n`);
+    });
+  });
+
+plugin
+  .command('enable')
+  .argument('<plugin>')
+  .description('Enable a trusted plugin')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.setPluginEnabled(id, true);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Enabled plugin "${updated.id}".\n`);
+    });
+  });
+
+plugin
+  .command('disable')
+  .argument('<plugin>')
+  .description('Disable a plugin')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.setPluginEnabled(id, false);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Disabled plugin "${updated.id}".\n`);
+    });
+  });
+
+plugin
+  .command('remove')
+  .argument('<plugin>')
+  .description('Remove a plugin (files are left on disk)')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      app.removePlugin(id);
+      process.stdout.write(`Removed plugin "${id}".\n`);
+    });
+  });
+
+plugin
+  .command('test')
+  .argument('<plugin>')
+  .description('Handshake the plugin and report protocol, version and capabilities')
+  .action(async (id: string) => {
+    await withApp(async (app) => {
+      const result = await app.testPlugin(id);
+      if (globalOptions().json) return printJson(result);
+      process.stdout.write(`${result.success ? 'OK' : 'FAILED'} ${id} (${result.latency_ms}ms)\n`);
+      for (const line of result.diagnostics) process.stdout.write(`  - ${line}\n`);
+    });
+  });
+
 // ------------------------------------------------------------------ jobs & schedules
 const job = program.command('job').description('Manage reusable jobs');
 
@@ -755,7 +1313,7 @@ job
   .requiredOption('--name <name>')
   .requiredOption('--conn <connection>')
   .requiredOption('--resource <resource>')
-  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json']).default('jsonl'))
+  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']).default('jsonl'))
   .addOption(new Option('--compression <mode>').choices(['none', 'gzip']).default('gzip'))
   .option('--out <directory>')
   .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
@@ -795,7 +1353,7 @@ job
   .requiredOption('--conn <connection>')
   .requiredOption('--resource <resource>')
   .requiredOption('--from <path>')
-  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json']))
+  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']))
   .addOption(new Option('--mode <mode>').choices(['append', 'upsert', 'truncate_and_load']).default('append'))
   .option('--key-columns <list>')
   .option('--confirm <connection_name>')
@@ -820,6 +1378,45 @@ job
           ...(options.format ? { format: options.format as ExportFormat } : {}),
           mode: options.mode as 'append' | 'upsert' | 'truncate_and_load',
           ...(options.keyColumns ? { key_columns: parseKeyColumns(String(options.keyColumns)) } : {}),
+          ...(options.confirm ? { confirm: String(options.confirm) } : {}),
+          ...(options.dryRun ? { dry_run: true } : {}),
+          ...(schedule ? { schedule } : {}),
+        });
+        if (globalOptions().json) return printJson(result);
+        process.stdout.write(`Created job "${result.job.name}" (${result.job.id}).\n`);
+        if (result.schedule?.next_run_at) process.stdout.write(`Next run: ${result.schedule.next_run_at}\n`);
+      });
+    });
+  });
+
+job
+  .command('add-sync')
+  .description('Create a sync job (optionally scheduled)')
+  .requiredOption('--name <name>')
+  .requiredOption('--pipeline <pipeline>')
+  .option('--limit <n>', 'maximum source rows', (value) => Number(value))
+  .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
+  .addOption(new Option('--on-error <mode>').choices(['fail', 'skip']))
+  .option('--confirm <target_connection_name>')
+  .option('--dry-run')
+  .option('--schedule <type>', 'once|interval|daily|weekly|monthly')
+  .option('--timezone <tz>', 'IANA timezone', 'UTC')
+  .option('--at <iso>', 'for --schedule once')
+  .option('--every-minutes <n>', 'interval in minutes', (value) => Number(value))
+  .option('--hour <n>', 'hour 0-23', (value) => Number(value))
+  .option('--minute <n>', 'minute 0-59', (value) => Number(value))
+  .option('--day <n>', 'monthly day', (value) => Number(value))
+  .option('--days <list>')
+  .action(async (options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp((app) => {
+        const schedule = buildScheduleInput(options);
+        const result = app.createSyncJob({
+          name: String(options.name),
+          pipeline_id: String(options.pipeline),
+          ...(options.limit ? { limit: Number(options.limit) } : {}),
+          ...(options.batchSize ? { batch_size: Number(options.batchSize) } : {}),
+          ...(options.onError ? { on_error: options.onError as 'fail' | 'skip' } : {}),
           ...(options.confirm ? { confirm: String(options.confirm) } : {}),
           ...(options.dryRun ? { dry_run: true } : {}),
           ...(schedule ? { schedule } : {}),

@@ -5,6 +5,7 @@ import { hasCapability } from './contract.js';
 import { MongoDbProvider } from './mongodb.js';
 import { MySqlProvider } from './mysql.js';
 import { PostgresProvider } from './postgresql.js';
+import { RestProvider } from './rest.js';
 import { SqliteProvider } from './sqlite.js';
 
 /** Built-in provider registry. External (IPC) providers are a later phase. */
@@ -17,6 +18,7 @@ export class ProviderRegistry {
       new PostgresProvider(),
       new MySqlProvider(),
       new MongoDbProvider(),
+      new RestProvider(),
     ]) {
       this.providers.set(provider.providerId, provider);
     }
@@ -24,6 +26,20 @@ export class ProviderRegistry {
 
   list(): ProviderDescriptor[] {
     return [...this.providers.values()].map((provider) => provider.descriptor());
+  }
+
+  /** Registers an external (plugin) provider; built-in ids are never overwritten. */
+  register(provider: DataProvider): void {
+    if (this.providers.has(provider.providerId)) {
+      throw new UdmtError('ALREADY_EXISTS', `Provider "${provider.providerId}" is already registered.`, {
+        details: { provider_id: provider.providerId },
+      });
+    }
+    this.providers.set(provider.providerId, provider);
+  }
+
+  remove(providerId: string): boolean {
+    return this.providers.delete(providerId);
   }
 
   get(providerId: string): DataProvider {

@@ -9,8 +9,9 @@ src/core            business logic (no UI, no HTTP)
   ├── state-machine.ts  the only legal operation transitions
   ├── service.ts        UdmtApp facade used by CLI, API and worker
   ├── db/               node:sqlite metadata store, versioned migrations, repositories
-  ├── providers/        contract + sqlite / postgresql / mysql / mongodb adapters + registry
-  ├── formats/          streaming CSV / JSONL / JSON writers & readers (+ gzip)
+  ├── providers/        contract + sqlite / postgresql / mysql / mongodb / rest adapters + registry
+  ├── plugins/          external provider manifest, process host and provider adapter
+  ├── formats/          CSV / JSONL / JSON (streaming) + XML / XLSX writers & readers (+ gzip)
   ├── operation/        unified operation engine (export, import, verify)
   ├── storage/          local artifact backend + manifest/checksum handling
   └── worker.ts         headless scheduler runtime, recovery, heartbeat
@@ -42,6 +43,9 @@ Contract (`src/core/providers/contract.ts`):
 - `readSchema` → columns with canonical types (`string|integer|number|boolean|timestamp|date|json|binary|unknown`).
 - `readRows` (optional) → async generator of row batches, cancellation-aware.
 - `writeRows` (optional) → streaming loader with `append` / `upsert` / `truncate_and_load`.
+
+Built-in providers are `sqlite`, `postgresql`, `mysql`/`mariadb`, `mongodb` and `rest` (a paginated,
+authenticated JSON API connector; see `docs/provider-contract/rest-connector.md`).
 
 Capabilities are declared in `descriptor().capabilities` and asserted before every operation
 (`ProviderRegistry.assertCapability`). External providers over IPC are Phase 7 and not implemented.
@@ -85,5 +89,6 @@ rewrite:
 
 ## 6. What is intentionally absent
 
-External plugin host, S3 storage, Data Sync engine, CDC, notifications, OS keyring and native dump
-tooling. Each has a documented state in `docs/IMPLEMENTATION-STATUS.md`; none is mocked or faked.
+CDC, notifications, OS keyring and native dump tooling. S3 storage, the Data Sync engine and the
+external plugin host are implemented (Phases 4–5, 7). Each has a documented state in
+`docs/IMPLEMENTATION-STATUS.md`; none is mocked or faked.

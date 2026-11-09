@@ -1,0 +1,14 @@
+{
+  "manifest_version": 1,
+  "id": "test.crash",
+  "name": "Crash-on-start fixture",
+  "version": "0.0.1",
+  "protocol": "udmt-provider/1",
+  "description": "Exits immediately after spawn so crash isolation can be tested.",
+  "runtime": { "command": "node", "args": ["plugin.mjs"] },
+  "permissions": ["read_config"],
+  "provider": {
+    "display_name": "Crash fixture",
+    "capabilities": ["test_connection", "read_data"]
+  }
+}

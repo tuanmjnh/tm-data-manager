@@ -43,6 +43,11 @@ const links = computed<NavigationMenuItem[][]>(() => [
     { label: t('nav.export'), icon: 'i-lucide-arrow-up-from-line', to: '/export', active: route.path === '/export' },
     { label: t('nav.import'), icon: 'i-lucide-arrow-down-to-line', to: '/import', active: route.path === '/import' },
     { label: t('nav.artifacts'), icon: 'i-lucide-package', to: '/artifacts', active: route.path === '/artifacts' },
+    { label: t('nav.storage'), icon: 'i-lucide-hard-drive', to: '/storage', active: route.path === '/storage' },
+    { label: t('nav.sync'), icon: 'i-lucide-arrow-right-left', to: '/sync', active: route.path === '/sync' },
+  ],
+  [
+    { label: t('nav.plugins'), icon: 'i-lucide-puzzle', to: '/plugins', active: route.path === '/plugins' },
   ],
   [
     { label: t('nav.operations'), icon: 'i-lucide-activity', to: '/operations', active: route.path.startsWith('/operations') },

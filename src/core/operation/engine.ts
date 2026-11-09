@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir, rm, readFile, writeFile, rename } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
 import { UdmtError, isUdmtError, toUdmtError, sanitizeErrorMessage } from '../errors.js';
 import type { AppPaths } from '../paths.js';
@@ -10,7 +11,16 @@ import type { ProviderRegistry } from '../providers/registry.js';
 import type { OperationContext, DataProvider } from '../providers/contract.js';
 import { hasCapability, inferType } from '../providers/contract.js';
 import type { LocalStorageBackend } from '../storage/local.js';
+import type { StorageBackend } from '../storage/contract.js';
 import { createFormatWriter, defaultExtension, detectFormat, readRowsFromFile, type FormatWriter } from '../formats/index.js';
+import {
+  SyncRowError,
+  compileSyncMapping,
+  evaluateSyncFilter,
+  syncTargetColumns,
+  transformSyncRow,
+  type CompiledSyncField,
+} from '../sync/pipeline.js';
 import { assertSafePath, assertSafeSegment } from '../paths.js';
 import { APP_VERSION, fileSize, newId, nowIso, sanitizeName, sha256File, timestampForFilename, truncate } from '../utils.js';
 import type {
@@ -25,13 +35,15 @@ import type {
   OperationStatus,
   RunProgress,
   RowBatch,
+  SyncPipelineRecord,
+  SyncRequest,
 } from '../types.js';
 import { EXPORT_FORMATS } from '../types.js';
 
 const ExportSchema = z.object({
   connection_id: z.string().min(1),
   resource: z.string().min(1),
-  format: z.enum(['jsonl', 'csv', 'json']),
+  format: z.enum(['jsonl', 'csv', 'json', 'xml', 'xlsx']),
   compression: z.enum(['none', 'gzip']),
   output_dir: z.string().optional(),
   limit: z.number().int().positive().optional(),
@@ -45,7 +57,7 @@ const ImportSchema = z.object({
   connection_id: z.string().min(1),
   resource: z.string().min(1),
   source: z.object({ artifact_id: z.string().optional(), path: z.string().optional() }),
-  format: z.enum(['jsonl', 'csv', 'json']).optional(),
+  format: z.enum(['jsonl', 'csv', 'json', 'xml', 'xlsx']).optional(),
   mode: z.enum(['append', 'upsert', 'truncate_and_load']),
   key_columns: z.array(z.string().min(1)).optional(),
   batch_size: z.number().int().min(1).max(5000).optional(),
@@ -54,12 +66,22 @@ const ImportSchema = z.object({
   create_resource: z.boolean().optional(),
 });
 
+const SyncSchema = z.object({
+  pipeline_id: z.string().min(1),
+  dry_run: z.boolean().optional(),
+  confirm: z.string().optional(),
+  limit: z.number().int().positive().optional(),
+  batch_size: z.number().int().min(1).max(5000).optional(),
+  on_error: z.enum(['fail', 'skip']).optional(),
+});
+
 export interface EngineDeps {
   store: Store;
   registry: ProviderRegistry;
   secrets: SecretStore;
   paths: AppPaths;
-  storage: LocalStorageBackend;
+  managedStorage: LocalStorageBackend;
+  resolveStorage: (idOrName?: string | null) => StorageBackend;
 }
 
 export interface StartedOperation {
@@ -197,11 +219,12 @@ export class OperationEngine {
   }
 
   private async executeExport(run: OperationRun, req: z.infer<typeof ExportSchema>, controller: AbortController): Promise<OperationRun> {
-    const { store, registry, secrets, storage } = this.deps;
+    const { store, registry, secrets, resolveStorage, managedStorage } = this.deps;
     const ctx = this.makeContext(run, controller);
     let writer: FormatWriter | undefined;
     let dataPath: string | undefined;
     let sidecarPath: string | undefined;
+    let uploadedObject: { backend: StorageBackend; key: string } | undefined;
     const warnings: string[] = [];
 
     try {
@@ -235,19 +258,27 @@ export class OperationEngine {
       }
       const columns: ColumnSchema[] = selected.length > 0 ? selected : schema.columns;
 
-      const backend = req.storage_backend_id
+      const backendRecord = req.storage_backend_id
         ? store.requireStorageBackend(req.storage_backend_id)
         : store.requireStorageBackend(connection.default_storage_id ?? undefined);
-      const managedRoot = backend.id === 'local-default' ? storage.root : resolve(storage.paths.artifactsDir, backend.id);
+      const backend = resolveStorage(backendRecord.id);
       const externalDir = req.output_dir ? resolve(req.output_dir) : undefined;
-      if (externalDir && !externalDir.startsWith(storage.root)) {
-        if (!/^[A-Za-z]:[\\/]|^\//.test(req.output_dir!) && !req.output_dir!.startsWith('~')) {
+      if (externalDir) {
+        if (backend.isRemote) {
+          throw new UdmtError(
+            'INVALID_INPUT',
+            'output_dir cannot be combined with a remote storage backend. Export to the backend and fetch the artifact instead.',
+          );
+        }
+        if (!(/^[A-Za-z]:[\\/]|^\//.test(req.output_dir!) || req.output_dir!.startsWith('~') || externalDir.startsWith(managedStorage.root))) {
           throw new UdmtError('PATH_UNSAFE', 'Relative output directories must resolve inside the managed artifacts root.');
         }
-        ctx.warn('Writing to an explicit external directory outside the managed artifacts root.');
+        if (!externalDir.startsWith(managedStorage.root)) {
+          ctx.warn('Writing to an explicit external directory outside the managed artifacts root.');
+        }
       }
 
-      const targetDir = externalDir ?? (backend.id === 'local-default' ? await storage.prepareRunDir(run.id) : join(managedRoot, run.id));
+      const targetDir = externalDir ?? (await backend.prepareStagingDir(run.id));
       await mkdir(targetDir, { recursive: true, mode: 0o700 });
       const safeResource = sanitizeName(req.resource.replace(/[./\\]/g, '_'));
       const fileName = `${sanitizeName(connection.name)}-${safeResource}-${timestampForFilename()}.${requestExtension(req.format, req.compression)}`;
@@ -320,21 +351,36 @@ export class OperationEngine {
       await writeFile(`${sidecarPath}.tmp`, JSON.stringify(manifest, null, 2), { mode: 0o600 });
       await rename(`${sidecarPath}.tmp`, sidecarPath);
 
-      const objectKey = externalDir ? dataPath : storage.objectKeyFor(dataPath);
+      const objectKey = externalDir ? dataPath : backend.objectKeyFor(dataPath, run.id);
+      let absolutePath = externalDir ? dataPath : backend.describeObject(objectKey);
+      let manifestPath = sidecarPath;
+      if (!externalDir && backend.isRemote) {
+        await backend.putObject(dataPath, objectKey, { sha256: checksum });
+        uploadedObject = { backend, key: objectKey };
+        const sidecarKey = `${objectKey}.manifest.json`;
+        await backend.putObject(sidecarPath, sidecarKey, { sha256: await sha256File(sidecarPath) });
+        // The remote object is now the durable copy; keep local staging lean.
+        await rm(dataPath, { force: true }).catch(() => undefined);
+        await rm(sidecarPath, { force: true }).catch(() => undefined);
+        dataPath = undefined;
+        sidecarPath = undefined;
+        absolutePath = backend.describeObject(objectKey);
+        manifestPath = backend.describeObject(sidecarKey);
+      }
       store.createArtifact({
         run_id: run.id,
         artifact_type: 'export',
         provider_id: connection.provider_id,
         storage_backend_id: backend.id,
         object_key: objectKey,
-        absolute_path: dataPath,
+        absolute_path: absolutePath,
         manifest,
         size_bytes: size,
         checksum_value: checksum,
       });
 
       store.updateRunStatus(run.id, 'verifying', { stage: 'verifying' });
-      const recheck = await sha256File(dataPath);
+      const recheck = backend.isRemote && !externalDir ? await backend.checksum(objectKey) : await sha256File(absolutePath);
       if (recheck !== checksum) {
         store.updateArtifactVerification(artifactId, 'failed');
         throw new UdmtError('OPERATION_FAILED', 'Checksum mismatch right after writing the artifact.');
@@ -348,8 +394,9 @@ export class OperationEngine {
         progress: { percent: 100, stage: 'completed', rows_read: written.row_count, bytes_written: size },
         result: {
           artifact_id: artifactId,
-          path: dataPath,
-          manifest_path: sidecarPath,
+          path: absolutePath,
+          manifest_path: manifestPath,
+          storage_backend_id: backend.id,
           rows: written.row_count,
           bytes: size,
           checksum_sha256: checksum,
@@ -362,7 +409,11 @@ export class OperationEngine {
       ctx.log('info', `Export completed: ${written.row_count} rows, ${size} bytes, sha256=${checksum.slice(0, 12)}…`);
       return store.requireRun(run.id);
     } catch (error) {
-      return this.failRun(run, error, { writer, cleanupPaths: [dataPath, sidecarPath] });
+      return this.failRun(run, error, {
+        writer,
+        cleanupPaths: [dataPath, sidecarPath],
+        cleanupObjects: uploadedObject ? [uploadedObject] : [],
+      });
     }
   }
 
@@ -412,6 +463,7 @@ export class OperationEngine {
     const { store, registry, secrets } = this.deps;
     const ctx = this.makeContext(run, controller);
     const warnings: string[] = [];
+    const cleanupPaths: string[] = [];
 
     try {
       store.updateRunStatus(run.id, 'preparing', { stage: 'preparing', started_at: nowIso() });
@@ -425,6 +477,7 @@ export class OperationEngine {
       }
 
       const source = await this.resolveImportSource(req, provider, connection.provider_id);
+      if (source.materialized) cleanupPaths.push(source.materialized);
       store.updateRunStatus(run.id, 'preflight', { stage: 'preflight' });
       ctx.log('info', `Preflight: ${source.path} (${source.format}) -> ${connection.name} ${req.resource} [${req.mode}]`);
 
@@ -567,6 +620,498 @@ export class OperationEngine {
       return store.requireRun(run.id);
     } catch (error) {
       return this.failRun(run, error);
+    } finally {
+      for (const path of cleanupPaths) {
+        await rm(path, { force: true }).catch(() => undefined);
+      }
+    }
+  }
+
+  // ------------------------------------------------------------------ sync
+  startSync(request: SyncRequest, options: { jobId?: string | null; workerId?: string | null } = {}): StartedOperation {
+    const parsed = SyncSchema.safeParse(request);
+    if (!parsed.success) {
+      throw new UdmtError('INVALID_INPUT', `Sync request is invalid: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+    }
+    const req = parsed.data;
+    const { store } = this.deps;
+    const pipeline = store.requireSyncPipeline(req.pipeline_id);
+    if (!pipeline.enabled) {
+      throw new UdmtError('PRECONDITION_FAILED', `Sync pipeline "${pipeline.name}" is disabled.`);
+    }
+    const source = store.requireConnection(pipeline.source_connection_id);
+    const target = store.requireConnection(pipeline.target_connection_id);
+    if (!source.is_active) throw new UdmtError('PRECONDITION_FAILED', `Source connection "${source.name}" is disabled.`);
+    if (!target.is_active) throw new UdmtError('PRECONDITION_FAILED', `Target connection "${target.name}" is disabled.`);
+    const run = store.createRun({
+      operation_type: 'sync',
+      status: 'queued',
+      source_connection_id: source.id,
+      target_connection_id: target.id,
+      source_label: source.name,
+      target_label: target.name,
+      resource: `${pipeline.source_resource} → ${pipeline.target_resource}`,
+      config: { ...req, pipeline_id: pipeline.id, pipeline_name: pipeline.name },
+      job_id: options.jobId ?? null,
+      worker_instance_id: options.workerId ?? null,
+    });
+    const controller = new AbortController();
+    this.controllers.set(run.id, controller);
+    const done = this.executeSync(run, req, pipeline, controller).finally(() => this.controllers.delete(run.id));
+    return { run, done };
+  }
+
+  async sync(request: SyncRequest): Promise<{ run: OperationRun }> {
+    const started = this.startSync(request);
+    const run = await started.done;
+    if (run.status !== 'completed' && run.status !== 'completed_with_warnings') {
+      throw new UdmtError(
+        (run.error_code as never) ?? 'OPERATION_FAILED',
+        run.error_message_safe ?? `Sync finished with status ${run.status}`,
+        { details: { run_id: run.id } },
+      );
+    }
+    return { run };
+  }
+
+  private async executeSync(
+    run: OperationRun,
+    req: z.infer<typeof SyncSchema>,
+    pipeline: SyncPipelineRecord,
+    controller: AbortController,
+  ): Promise<OperationRun> {
+    const { store, registry, secrets } = this.deps;
+    const ctx = this.makeContext(run, controller);
+    const stats = {
+      rows_read: 0,
+      rows_filtered: 0,
+      rows_written: 0,
+      rows_skipped: 0,
+      transformed: 0,
+      errors: 0,
+      errors_persisted: 0,
+      attempts: 0,
+    };
+    const MAX_PERSISTED_ERRORS = 500;
+
+    const recordRowError = (rowIndex: number, error: unknown): void => {
+      const code = error instanceof SyncRowError ? error.code : 'TRANSFORM_FAILED';
+      const message = truncate(sanitizeErrorMessage((error as Error).message ?? String(error)), 500);
+      stats.errors += 1;
+      if (stats.errors_persisted < MAX_PERSISTED_ERRORS) {
+        store.recordSyncError({
+          run_id: run.id,
+          pipeline_id: pipeline.id,
+          batch_index: null,
+          row_index: rowIndex,
+          code,
+          message,
+        });
+        stats.errors_persisted += 1;
+      }
+      ctx.log('warn', `Row ${rowIndex} skipped (${code}): ${message}`);
+    };
+
+    try {
+      store.updateRunStatus(run.id, 'preparing', { stage: 'preparing', started_at: nowIso() });
+      const source = store.requireConnection(pipeline.source_connection_id);
+      const target = store.requireConnection(pipeline.target_connection_id);
+      const sourceProvider = registry.get(source.provider_id);
+      const targetProvider = registry.get(target.provider_id);
+      const sourceSecret = secrets.load(source.credential_ref);
+      const targetSecret = secrets.load(target.credential_ref);
+      const sourceDescriptor = sourceProvider.descriptor();
+      const targetDescriptor = targetProvider.descriptor();
+
+      if (!hasCapability(sourceDescriptor, 'read_data')) {
+        throw new UdmtError('CAPABILITY_UNSUPPORTED', `Source provider "${source.provider_id}" cannot read data.`);
+      }
+      if (!hasCapability(targetDescriptor, 'write_data')) {
+        throw new UdmtError('CAPABILITY_UNSUPPORTED', `Target provider "${target.provider_id}" cannot write data.`);
+      }
+      if (!hasCapability(sourceDescriptor, 'schema_read')) {
+        throw new UdmtError('CAPABILITY_UNSUPPORTED', `Source provider "${source.provider_id}" cannot read schema.`);
+      }
+
+      const sourceValidated = sourceProvider.validateConfig(source.config, sourceSecret);
+      const targetValidated = targetProvider.validateConfig(target.config, targetSecret);
+      const sourceSchema = await sourceProvider.readSchema!(sourceValidated.config, sourceSecret, pipeline.source_resource, ctx);
+      const targetSchema = hasCapability(targetDescriptor, 'schema_read')
+        ? await targetProvider
+            .readSchema!(targetValidated.config, targetSecret, pipeline.target_resource, ctx)
+            .catch(() => undefined)
+        : undefined;
+
+      const fields = compileSyncMapping(pipeline.mapping, sourceSchema.columns);
+      const targetColumns = syncTargetColumns(fields, pipeline.key_columns);
+      const normalizedMode = pipeline.load_mode === 'replace_resource' ? 'truncate_and_load' : pipeline.load_mode;
+      const destructive = normalizedMode === 'truncate_and_load';
+
+      if (normalizedMode === 'upsert' && pipeline.key_columns.length === 0) {
+        throw new UdmtError('INVALID_INPUT', 'Sync mode upsert requires at least one key column.');
+      }
+      const targetNames = new Set(fields.map((field) => field.target));
+      const invalidKeys = pipeline.key_columns.filter((key) => !targetNames.has(key));
+      if (invalidKeys.length > 0) {
+        throw new UdmtError('INVALID_INPUT', `Key columns are not mapped to the target: ${invalidKeys.join(', ')}`);
+      }
+      const filter = pipeline.options.filter ?? null;
+      if (filter) {
+        const sourceNames = new Set(sourceSchema.columns.map((column) => column.name));
+        if (!sourceNames.has(filter.column)) {
+          throw new UdmtError('INVALID_INPUT', `Filter column "${filter.column}" is not in the source schema.`);
+        }
+        if (filter.operator === 'in' && !Array.isArray(filter.value)) {
+          throw new UdmtError('INVALID_INPUT', 'Filter operator "in" needs an array value.');
+        }
+      }
+
+      // Incremental (watermark) reads: opt-in, capability-gated, never destructive.
+      const incremental = pipeline.options.incremental ?? null;
+      let incrementalRead: { column: string; after: unknown } | null = null;
+      if (incremental) {
+        const column = incremental.column?.trim();
+        if (!column) throw new UdmtError('INVALID_INPUT', 'Incremental sync needs a watermark column.');
+        if (destructive) {
+          throw new UdmtError('INVALID_INPUT', 'Incremental sync cannot be combined with truncate_and_load.');
+        }
+        if (!hasCapability(sourceDescriptor, 'incremental_read')) {
+          throw new UdmtError(
+            'CAPABILITY_UNSUPPORTED',
+            `Source provider "${source.provider_id}" does not support incremental watermark reads.`,
+          );
+        }
+        if (!sourceSchema.columns.some((entry) => entry.name === column)) {
+          throw new UdmtError('INVALID_INPUT', `Watermark column "${column}" is not in the source schema.`);
+        }
+        const previousState = store.getSyncState(pipeline.id);
+        const previousWatermark = (previousState?.checkpoint as { watermark?: { column?: string; value?: unknown } } | undefined)?.watermark;
+        const after = previousWatermark && previousWatermark.column === column ? previousWatermark.value : (incremental.initial ?? null);
+        incrementalRead = { column, after: after ?? null };
+      }
+
+      const dryRun = req.dry_run ?? pipeline.options.dry_run ?? false;
+      if (!dryRun) {
+        if (destructive && req.confirm !== target.name) {
+          throw new UdmtError(
+            'CONFIRMATION_REQUIRED',
+            `Sync will replace data in ${target.name}. Re-run with --confirm "${target.name}" to authorize this.`,
+          );
+        }
+        if (target.environment === 'production' && normalizedMode !== 'append' && req.confirm !== target.name) {
+          throw new UdmtError(
+            'CONFIRMATION_REQUIRED',
+            `Connection "${target.name}" is marked production. Re-run with --confirm "${target.name}".`,
+          );
+        }
+      }
+
+      const warnings: string[] = [];
+      const schemaEvolution = pipeline.options.schema_evolution ?? 'ignore';
+      if (targetSchema) {
+        const existing = new Set(targetSchema.columns.map((column) => column.name));
+        const missing = fields.map((field) => field.target).filter((name) => !existing.has(name));
+        if (missing.length > 0 && schemaEvolution !== 'add_columns') {
+          warnings.push(`Target columns missing (will be created by the provider if allowed): ${missing.join(', ')}`);
+        }
+      }
+      const unknown = fields.filter((field) => field.cast === 'unknown');
+      if (unknown.length > 0) {
+        warnings.push(`Fields without a type mapping are written as-is: ${unknown.map((field) => field.target).join(', ')}`);
+      }
+
+      const batchSize = req.batch_size ?? pipeline.options.batch_size ?? 1000;
+      const onError = req.on_error ?? pipeline.options.on_error ?? 'fail';
+      const limit = req.limit ?? pipeline.options.limit;
+      const readColumns = [
+        ...new Set([
+          ...fields.map((field) => field.source),
+          ...(filter ? [filter.column] : []),
+          ...(incrementalRead ? [incrementalRead.column] : []),
+        ]),
+      ];
+      let retries = Math.min(Math.max(pipeline.options.retry?.max_attempts ?? 1, 1), 3);
+      if (normalizedMode === 'append') retries = 1; // appending twice is not idempotent
+      const backoffMs = Math.min(Math.max(pipeline.options.retry?.backoff_ms ?? 1000, 0), 30_000);
+
+      store.updateRunStatus(run.id, 'preflight', { stage: 'preflight' });
+      ctx.log(
+        'info',
+        `Preflight: ${source.name}.${pipeline.source_resource} -> ${target.name}.${pipeline.target_resource} ` +
+          `[${pipeline.load_mode}] ${fields.length} mapped field(s), filter=${filter ? `${filter.column} ${filter.operator}` : 'none'}`,
+      );
+
+      if (dryRun) {
+        const sampleLimit = Math.min(limit ?? 1000, 1000);
+        let sampled = 0;
+        let matched = 0;
+        let firstError: string | null = null;
+        const sampleErrors: string[] = [];
+        for await (const rows of sourceProvider.readRows!(
+          sourceValidated.config,
+          sourceSecret,
+          {
+            resource: pipeline.source_resource,
+            batchSize,
+            columns: readColumns,
+            limit: sampleLimit,
+            ...(incrementalRead ? { incremental: incrementalRead } : {}),
+          },
+          ctx,
+        )) {
+          for (const row of rows) {
+            ctx.throwIfCancelled();
+            if (sampled >= sampleLimit) break;
+            sampled += 1;
+            try {
+              if (!evaluateSyncFilter(row, filter)) continue;
+              matched += 1;
+              transformSyncRow(row, fields);
+            } catch (error) {
+              const code = error instanceof SyncRowError ? error.code : 'TRANSFORM_FAILED';
+              const message = sanitizeErrorMessage((error as Error).message ?? String(error));
+              if (!firstError) firstError = `${code}: ${message}`;
+              sampleErrors.push(message);
+              recordRowError(sampled, error);
+            }
+          }
+          if (sampled >= sampleLimit) break;
+        }
+        const status: OperationStatus = sampleErrors.length > 0 ? 'completed_with_warnings' : 'completed';
+        store.updateRunStatus(run.id, 'finalizing', { stage: 'dry_run' });
+        store.updateRunStatus(run.id, status, {
+          stage: 'completed',
+          finished_at: nowIso(),
+          progress: { percent: 100, stage: 'completed', rows_read: sampled },
+          result: {
+            dry_run: true,
+            pipeline_id: pipeline.id,
+            rows_sampled: sampled,
+            rows_matched: matched,
+            mapping: fields.map((field) => ({ source: field.source, target: field.target, type: field.cast })),
+            target_columns: targetSchema?.columns.map((column) => column.name) ?? null,
+            watermark: incrementalRead ? { column: incrementalRead.column, after: incrementalRead.after ?? null } : null,
+            warnings: [...warnings, ...(firstError ? [`First row error: ${firstError}`] : [])],
+            errors: sampleErrors.length,
+            error_samples: sampleErrors.slice(0, 20),
+          },
+        });
+        ctx.log('info', `Dry run finished: ${sampled} rows sampled, ${matched} matched, ${sampleErrors.length} row errors.`);
+        return store.requireRun(run.id);
+      }
+
+      store.updateRunStatus(run.id, 'running', { stage: 'running' });
+
+      let maxWatermark: unknown = incrementalRead?.after ?? null;
+      let succeeded = false;
+      for (let attempt = 1; attempt <= retries; attempt += 1) {
+        stats.attempts = attempt;
+        if (attempt > 1) {
+          maxWatermark = incrementalRead?.after ?? null;
+          store.clearSyncErrors(run.id);
+          stats.errors = 0;
+          stats.errors_persisted = 0;
+          stats.rows_read = 0;
+          stats.rows_filtered = 0;
+          stats.rows_written = 0;
+          stats.rows_skipped = 0;
+          stats.transformed = 0;
+          ctx.log('warn', `Retrying sync (attempt ${attempt}/${retries}) after a transient failure.`);
+        }
+        try {
+          let batchIndex = 0;
+          let rowIndex = 0;
+          const writeResult = await targetProvider.writeRows!(
+            targetValidated.config,
+            targetSecret,
+            {
+              resource: pipeline.target_resource,
+              columns: targetColumns,
+              mode: normalizedMode as 'append' | 'upsert' | 'truncate_and_load',
+              keyColumns: pipeline.key_columns,
+              createResource: pipeline.options.create_resource ?? true,
+              ...(pipeline.options.conflict_policy ? { onConflict: pipeline.options.conflict_policy } : {}),
+              schemaEvolution: pipeline.options.schema_evolution ?? 'ignore',
+            },
+            async function* (this: OperationEngine): AsyncGenerator<RowBatch> {
+              let out: RowBatch = [];
+              outer: for await (const rows of sourceProvider.readRows!(
+                sourceValidated.config,
+                sourceSecret,
+                {
+                  resource: pipeline.source_resource,
+                  batchSize,
+                  columns: readColumns,
+                  ...(limit ? { limit } : {}),
+                  ...(incrementalRead ? { incremental: incrementalRead } : {}),
+                },
+                ctx,
+              )) {
+                for (const sourceRow of rows) {
+                  ctx.throwIfCancelled();
+                  if (limit && rowIndex >= limit) break outer;
+                  rowIndex += 1;
+                  stats.rows_read += 1;
+                  if (incrementalRead) {
+                    const value = sourceRow[incrementalRead.column];
+                    if (value !== null && value !== undefined) maxWatermark = maxWatermarkOf(maxWatermark, value);
+                  }
+                  try {
+                    if (!evaluateSyncFilter(sourceRow, filter)) {
+                      stats.rows_filtered += 1;
+                      continue;
+                    }
+                    const transformed = transformSyncRow(sourceRow, fields);
+                    stats.transformed += transformed.transformed;
+                    out.push(transformed.row);
+                  } catch (error) {
+                    if (onError === 'fail') {
+                      const code = error instanceof SyncRowError ? error.code : 'TRANSFORM_FAILED';
+                      throw new UdmtError(
+                        'SYNC_ROW_ERROR',
+                        `Sync stopped at source row ${rowIndex} (${code}): ${sanitizeErrorMessage((error as Error).message)}`,
+                        { details: { code, row_index: rowIndex, pipeline_id: pipeline.id } },
+                      );
+                    }
+                    stats.rows_skipped += 1;
+                    recordRowError(rowIndex, error);
+                    continue;
+                  }
+                  if (out.length >= batchSize) {
+                    batchIndex += 1;
+                    ctx.progress({
+                      percent: limit
+                        ? Math.min(96, Math.round((rowIndex / limit) * 96))
+                        : Math.min(90, 20 + Math.log10(Math.max(rowIndex, 1)) * 15),
+                      metrics: { rows_read: stats.rows_read, rows_written: stats.rows_written },
+                    });
+                    yield out;
+                    out = [];
+                  }
+                }
+              }
+              if (out.length > 0) {
+                batchIndex += 1;
+                yield out;
+              }
+              ctx.log('info', `Source stream finished after ${stats.rows_read} row(s), ${batchIndex} batch(es).`);
+            }.call(this),
+            ctx,
+          );
+          stats.rows_written = writeResult.rows_written;
+          // Provider-level skips (for example upsert conflict_policy "ignore") must be reported too.
+          stats.rows_skipped += writeResult.rows_skipped;
+          warnings.push(...writeResult.warnings);
+          succeeded = true;
+          break;
+        } catch (error) {
+          const retryable =
+            attempt < retries &&
+            !controller.signal.aborted &&
+            isTransientSyncError(error) &&
+            normalizedMode !== 'append';
+          if (!retryable) throw error;
+          ctx.progress({ stage: 'retry_waiting', message: `Transient failure; retrying in ${backoffMs}ms` });
+          await sleep(backoffMs);
+        }
+      }
+      if (!succeeded) {
+        throw new UdmtError('OPERATION_FAILED', 'Sync did not complete after retries.');
+      }
+
+      store.updateRunStatus(run.id, 'finalizing', { stage: 'finalizing' });
+      const finalWarnings = [...warnings];
+      if (stats.errors > stats.errors_persisted) {
+        finalWarnings.push(`${stats.errors - stats.errors_persisted} additional row errors were not persisted (cap ${MAX_PERSISTED_ERRORS}).`);
+      }
+      if (stats.rows_skipped > 0) {
+        finalWarnings.push(`${stats.rows_skipped} row(s) were skipped and reported in the sync error list.`);
+      }
+      const finalStatus: OperationStatus = finalWarnings.length > 0 || stats.errors > 0 ? 'completed_with_warnings' : 'completed';
+      const finishedAt = nowIso();
+      store.updateRunStatus(run.id, finalStatus, {
+        stage: 'completed',
+        finished_at: finishedAt,
+        progress: {
+          percent: 100,
+          stage: 'completed',
+          rows_read: stats.rows_read,
+          rows_written: stats.rows_written,
+        },
+        result: {
+          pipeline_id: pipeline.id,
+          pipeline_name: pipeline.name,
+          rows_read: stats.rows_read,
+          rows_filtered: stats.rows_filtered,
+          rows_written: stats.rows_written,
+          rows_skipped: stats.rows_skipped,
+          values_transformed: stats.transformed,
+          errors: stats.errors,
+          errors_persisted: stats.errors_persisted,
+          mode: pipeline.load_mode,
+          attempts: stats.attempts,
+          source: `${source.name}.${pipeline.source_resource}`,
+          target: `${target.name}.${pipeline.target_resource}`,
+          warnings: finalWarnings,
+        },
+      });
+      const previous = store.getSyncState(pipeline.id);
+      store.upsertSyncState({
+        pipeline_id: pipeline.id,
+        checkpoint: incrementalRead
+          ? {
+              checkpoint_version: 1,
+              kind: 'incremental',
+              column: incrementalRead.column,
+              watermark: { column: incrementalRead.column, value: maxWatermark ?? incrementalRead.after ?? null },
+              completed_at: finishedAt,
+              rows_read: stats.rows_read,
+              rows_written: stats.rows_written,
+              rows_filtered: stats.rows_filtered,
+            }
+          : {
+              checkpoint_version: 1,
+              kind: 'full',
+              completed_at: finishedAt,
+              rows_read: stats.rows_read,
+              rows_written: stats.rows_written,
+              rows_filtered: stats.rows_filtered,
+            },
+        last_run_id: run.id,
+        last_run_at: finishedAt,
+        last_status: finalStatus,
+        rows_synced: Number(previous?.rows_synced ?? 0) + stats.rows_written,
+      });
+      store.audit('sync.completed', {
+        pipeline_id: pipeline.id,
+        rows: stats.rows_written,
+        errors: stats.errors,
+        mode: pipeline.load_mode,
+        ...(incrementalRead ? { watermark: maxWatermark ?? null } : {}),
+      }, run.id);
+      ctx.log('info', `Sync completed: ${stats.rows_written} rows written, ${stats.rows_skipped} skipped.`);
+      return store.requireRun(run.id);
+    } catch (error) {
+      try {
+        const previous = store.getSyncState(pipeline.id);
+        store.upsertSyncState({
+          pipeline_id: pipeline.id,
+          checkpoint: {
+            ...(previous?.checkpoint ?? {}),
+            partial: true,
+            failed_at: nowIso(),
+            rows_read: stats.rows_read,
+            rows_written: stats.rows_written,
+          },
+          last_run_id: run.id,
+          last_run_at: nowIso(),
+          last_status: 'failed',
+          rows_synced: Number(previous?.rows_synced ?? 0),
+        });
+      } catch {
+        /* state persistence must not mask the original failure */
+      }
+      return this.failRun(run, error);
     }
   }
 
@@ -588,12 +1133,14 @@ export class OperationEngine {
     const ctx = this.makeContext(run, controller);
     try {
       store.updateRunStatus(run.id, 'preparing', { stage: 'preparing', started_at: nowIso() });
-      if (!existsSync(artifact.absolute_path)) {
+      const remote = /^s3:\/\//.test(artifact.absolute_path);
+      if (!remote && !existsSync(artifact.absolute_path)) {
         throw new UdmtError('NOT_FOUND', `Artifact file is missing: ${artifact.absolute_path}`);
       }
       store.updateRunStatus(run.id, 'preflight', { stage: 'preflight' });
       store.updateRunStatus(run.id, 'running', { stage: 'hashing' });
-      const actual = await sha256File(artifact.absolute_path);
+      const backend = remote ? this.deps.resolveStorage(artifact.storage_backend_id) : null;
+      const actual = backend ? await backend.checksum(artifact.object_key) : await sha256File(artifact.absolute_path);
       const valid = actual === artifact.checksum_value;
       store.updateArtifactVerification(artifact.id, valid ? 'verified' : 'failed', valid ? actual : undefined);
       if (!valid) {
@@ -625,24 +1172,36 @@ export class OperationEngine {
     format: ExportFormat;
     columns: ColumnSchema[];
     manifest: ArtifactManifest | null;
+    /** Local temp file created for a remote artifact, removed after the run. */
+    materialized?: string | null;
   }> {
     const { store } = this.deps;
     if (req.source.artifact_id) {
       const artifact = store.requireArtifact(req.source.artifact_id);
-      if (!existsSync(artifact.absolute_path)) {
-        throw new UdmtError('NOT_FOUND', `Artifact file is missing: ${artifact.absolute_path}`);
-      }
       if (artifact.manifest.provider_id !== providerId) {
         throw new UdmtError(
           'PRECONDITION_FAILED',
           `Artifact was produced by ${artifact.manifest.provider_id} but the target is ${providerId}. Use a file path to force a cross-provider import.`,
         );
       }
+      let path = artifact.absolute_path;
+      let materialized: string | null = null;
+      if (/^s3:\/\//.test(path)) {
+        const backend = this.deps.resolveStorage(artifact.storage_backend_id);
+        const dir = join(this.deps.paths.tempDir, 'staging', `artifact-${artifact.id}`);
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        path = join(dir, basename(artifact.object_key));
+        await backend.getObject(artifact.object_key, path);
+        materialized = path;
+      } else if (!existsSync(path)) {
+        throw new UdmtError('NOT_FOUND', `Artifact file is missing: ${path}`);
+      }
       return {
-        path: artifact.absolute_path,
+        path,
         format: req.format ?? artifact.manifest.format,
         columns: artifact.manifest.columns,
         manifest: artifact.manifest,
+        materialized,
       };
     }
 
@@ -706,7 +1265,11 @@ export class OperationEngine {
   private async failRun(
     run: OperationRun,
     error: unknown,
-    options: { writer?: FormatWriter; cleanupPaths?: Array<string | undefined> } = {},
+    options: {
+      writer?: FormatWriter;
+      cleanupPaths?: Array<string | undefined>;
+      cleanupObjects?: Array<{ backend: StorageBackend; key: string }>;
+    } = {},
   ): Promise<OperationRun> {
     const { store } = this.deps;
     const udmt = toUdmtError(error, 'OPERATION_FAILED');
@@ -724,6 +1287,10 @@ export class OperationEngine {
       await rm(path, { force: true }).catch(() => undefined);
       await rm(`${path}.manifest.json`, { force: true }).catch(() => undefined);
       await rm(`${path}.manifest.json.tmp`, { force: true }).catch(() => undefined);
+    }
+    for (const object of options.cleanupObjects ?? []) {
+      await object.backend.deleteObject(object.key).catch(() => undefined);
+      await object.backend.deleteObject(`${object.key}.manifest.json`).catch(() => undefined);
     }
 
     try {
@@ -783,6 +1350,42 @@ function matchesType(value: unknown, type: ColumnSchema['type']): boolean {
     default:
       return true;
   }
+}
+
+const TRANSIENT_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'EPIPE',
+  'ENOTFOUND',
+  'SQLITE_BUSY',
+  'SQLITE_LOCKED',
+  'EBUSY',
+]);
+
+/**
+ * Retry eligibility for sync runs. Row-level transform errors are never
+ * transient; network and lock contention usually are.
+ */
+/** Picks the larger of two watermark values, comparing numerically when possible. */
+function maxWatermarkOf(current: unknown, value: unknown): unknown {
+  if (current === null || current === undefined) return value;
+  const left = Number(current);
+  const right = Number(value);
+  if (Number.isFinite(left) && Number.isFinite(right)) return right > left ? value : current;
+  return String(value) > String(current) ? value : current;
+}
+
+function isTransientSyncError(error: unknown): boolean {
+  if (isUdmtError(error)) return error.retryable;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && TRANSIENT_ERROR_CODES.has(code)) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|temporary|transient|connection reset|socket hang up|database is locked|rate limit|too many requests|\b(429|502|503|504)\b/i.test(
+    message,
+  );
 }
 
 export function formatFormats(): ExportFormat[] {

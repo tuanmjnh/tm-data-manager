@@ -93,7 +93,7 @@ export interface RunProgress {
 export interface OperationRun {
   id: string
   job_id: string | null
-  operation_type: 'export' | 'import' | 'verify'
+  operation_type: 'export' | 'import' | 'verify' | 'sync'
   status: string
   source_connection_id: string | null
   target_connection_id: string | null
@@ -149,6 +149,152 @@ export interface Artifact {
   created_at: string
   expires_at: string | null
   pinned: boolean
+}
+
+export type StorageBackendType = 'local' | 's3'
+
+export interface StorageBackendRecord {
+  id: string
+  name: string
+  backend_type: StorageBackendType
+  config: Record<string, unknown>
+  credential_ref: string | null
+  is_default: boolean
+  endpoint_hint: string | null
+  last_tested_at: string | null
+  last_test_status: 'success' | 'failed' | null
+  created_at: string
+  updated_at: string
+}
+
+export interface StorageTestResult {
+  success: boolean
+  latency_ms: number
+  diagnostics: string[]
+  endpoint_hint: string | null
+  tested_at: string
+}
+
+export type SyncLoadMode = 'append' | 'upsert' | 'truncate_and_load' | 'replace_resource'
+
+export type SyncFilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'in' | 'is_null' | 'not_null'
+
+export interface SyncFilter {
+  column: string
+  operator: SyncFilterOperator
+  value?: unknown
+}
+
+export type SyncMask = 'email' | 'full' | 'last4'
+
+export interface SyncFieldMapping {
+  source: string
+  target?: string
+  cast?: string
+  default?: unknown
+  trim?: boolean
+  mask?: SyncMask
+  value_map?: Record<string, string>
+}
+
+export interface SyncOptions {
+  filter?: SyncFilter | null
+  batch_size?: number
+  on_error?: 'fail' | 'skip'
+  retry?: { max_attempts?: number; backoff_ms?: number }
+  dry_run?: boolean
+  confirm?: string
+  create_resource?: boolean
+  limit?: number
+  incremental?: { column: string; initial?: unknown } | null
+  conflict_policy?: 'overwrite' | 'ignore'
+  schema_evolution?: 'ignore' | 'add_columns'
+}
+
+export interface SyncPipeline {
+  id: string
+  name: string
+  source_connection_id: string
+  target_connection_id: string
+  source_resource: string
+  target_resource: string
+  mapping: SyncFieldMapping[]
+  load_mode: SyncLoadMode
+  key_columns: string[]
+  options: SyncOptions
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface SyncState {
+  pipeline_id: string
+  checkpoint: Record<string, unknown>
+  last_run_id: string | null
+  last_run_at: string | null
+  last_status: string | null
+  rows_synced: number
+  updated_at: string
+}
+
+export interface SyncRunError {
+  id: number
+  run_id: string
+  pipeline_id: string | null
+  batch_index: number | null
+  row_index: number | null
+  code: string
+  message: string
+  created_at: string
+}
+
+export type PluginPermission = 'read_config' | 'read_secrets' | 'network' | 'filesystem' | 'write_data'
+
+export interface PluginManifest {
+  manifest_version: 1
+  id: string
+  name: string
+  version: string
+  protocol: string
+  description?: string
+  runtime: { command: string; args?: string[] }
+  permissions: PluginPermission[]
+  provider: {
+    display_name: string
+    version?: string
+    capabilities: string[]
+    config_fields?: ConfigField[]
+    secret_fields?: string[]
+  }
+}
+
+export interface PluginRecord {
+  id: string
+  name: string
+  version: string
+  protocol_version: string
+  description: string | null
+  manifest: PluginManifest
+  install_path: string
+  enabled: boolean
+  trusted: boolean
+  requested_permissions: PluginPermission[]
+  granted_permissions: PluginPermission[]
+  status: 'installed' | 'disabled' | 'error'
+  last_error: string | null
+  last_handshake_at: string | null
+  installed_at: string
+  updated_at: string
+}
+
+export interface PluginTestResult {
+  success: boolean
+  protocol_version: string | null
+  server: { name: string; version: string } | null
+  capabilities: string[]
+  latency_ms: number
+  diagnostics: string[]
+  tested_at: string
 }
 
 export interface LogEntry {
