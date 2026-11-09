@@ -36,9 +36,31 @@ import type {
   StorageBackendRecord,
   StorageBackendType,
   StorageTestResult,
+  SyncFieldMapping,
+  SyncLoadMode,
+  SyncOptions,
+  SyncPipelineRecord,
+  SyncRequest,
+  SyncRunError,
+  SyncStateRecord,
   WorkerInstance,
 } from './types.js';
-import { ENVIRONMENTS, PREVIEW_ROW_LIMIT, STORAGE_BACKEND_TYPES } from './types.js';
+import { ENVIRONMENTS, PREVIEW_ROW_LIMIT, STORAGE_BACKEND_TYPES, SYNC_LOAD_MODES } from './types.js';
+
+export interface CreateSyncPipelineInput {
+  name: string;
+  source_connection_id: string;
+  target_connection_id: string;
+  source_resource: string;
+  target_resource: string;
+  mapping?: SyncFieldMapping[];
+  load_mode?: SyncLoadMode;
+  key_columns?: string[];
+  options?: SyncOptions;
+  enabled?: boolean;
+}
+
+export type UpdateSyncPipelineInput = Partial<Omit<CreateSyncPipelineInput, 'name'>> & { name?: string };
 
 export interface CreateStorageBackendInput {
   name: string;
@@ -568,6 +590,207 @@ export class UdmtApp {
     const result = await backend.test();
     this.store.recordStorageTest(record.id, result.success ? 'success' : 'failed', result.endpoint_hint);
     return { ...result, tested_at: nowIso() };
+  }
+
+  // ------------------------------------------------------------------ sync
+  listSyncPipelines(): SyncPipelineRecord[] {
+    return this.store.listSyncPipelines();
+  }
+
+  getSyncPipeline(idOrName: string): SyncPipelineRecord {
+    return this.store.requireSyncPipeline(idOrName);
+  }
+
+  createSyncPipeline(input: CreateSyncPipelineInput): SyncPipelineRecord {
+    const name = input.name?.trim();
+    if (!name) throw new UdmtError('INVALID_INPUT', 'Sync pipeline name is required.');
+    const source = this.store.requireConnection(input.source_connection_id);
+    const target = this.store.requireConnection(input.target_connection_id);
+    const sourceResource = input.source_resource?.trim();
+    const targetResource = input.target_resource?.trim();
+    if (!sourceResource) throw new UdmtError('INVALID_INPUT', 'Source resource is required.');
+    if (!targetResource) throw new UdmtError('INVALID_INPUT', 'Target resource is required.');
+    const loadMode = this.normalizeSyncLoadMode(input.load_mode ?? 'append');
+    const keyColumns = this.normalizeSyncKeys(loadMode, input.key_columns ?? [], input.mapping ?? []);
+    if (this.store.getSyncPipeline(name)) {
+      throw new UdmtError('ALREADY_EXISTS', `Sync pipeline "${name}" already exists.`);
+    }
+    const created = this.store.createSyncPipeline({
+      name,
+      source_connection_id: source.id,
+      target_connection_id: target.id,
+      source_resource: sourceResource,
+      target_resource: targetResource,
+      mapping: this.normalizeSyncMapping(input.mapping ?? []),
+      load_mode: loadMode,
+      key_columns: keyColumns,
+      options: this.normalizeSyncOptions(input.options ?? {}),
+      enabled: input.enabled ?? true,
+    });
+    this.store.audit('sync.pipeline_created', { pipeline: created.name, mode: created.load_mode });
+    return created;
+  }
+
+  updateSyncPipeline(idOrName: string, patch: UpdateSyncPipelineInput): SyncPipelineRecord {
+    const existing = this.store.requireSyncPipeline(idOrName);
+    const source = patch.source_connection_id
+      ? this.store.requireConnection(patch.source_connection_id)
+      : this.store.requireConnection(existing.source_connection_id);
+    const target = patch.target_connection_id
+      ? this.store.requireConnection(patch.target_connection_id)
+      : this.store.requireConnection(existing.target_connection_id);
+    if (patch.name && patch.name.trim() !== existing.name) {
+      const duplicate = this.store.getSyncPipeline(patch.name.trim());
+      if (duplicate) throw new UdmtError('ALREADY_EXISTS', `Sync pipeline "${patch.name}" already exists.`);
+    }
+    const loadMode = patch.load_mode ? this.normalizeSyncLoadMode(patch.load_mode) : existing.load_mode;
+    const mapping = patch.mapping ? this.normalizeSyncMapping(patch.mapping) : existing.mapping;
+    const keyColumns = this.normalizeSyncKeys(
+      loadMode,
+      patch.key_columns ?? existing.key_columns,
+      mapping,
+    );
+    const updated = this.store.updateSyncPipeline(existing.id, {
+      name: patch.name?.trim() ?? existing.name,
+      source_connection_id: source.id,
+      target_connection_id: target.id,
+      source_resource: patch.source_resource?.trim() ?? existing.source_resource,
+      target_resource: patch.target_resource?.trim() ?? existing.target_resource,
+      mapping,
+      load_mode: loadMode,
+      key_columns: keyColumns,
+      options: patch.options ? this.normalizeSyncOptions({ ...existing.options, ...patch.options }) : existing.options,
+      enabled: patch.enabled ?? existing.enabled,
+    });
+    this.store.audit('sync.pipeline_updated', { pipeline: updated.name });
+    return updated;
+  }
+
+  deleteSyncPipeline(idOrName: string): void {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    const active = this.store
+      .listRuns({ limit: 500 })
+      .filter((run) => !isTerminal(run.status) && run.operation_type === 'sync')
+      .some((run) => (run.config as { pipeline_id?: string }).pipeline_id === pipeline.id);
+    if (active) throw new UdmtError('CONFLICT', 'Sync pipeline has an active run. Cancel or wait for it to finish first.');
+    this.store.deleteSyncPipeline(pipeline.id);
+    this.store.audit('sync.pipeline_deleted', { pipeline: pipeline.name });
+  }
+
+  syncState(idOrName: string): SyncStateRecord | null {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    return this.store.getSyncState(pipeline.id) ?? null;
+  }
+
+  syncErrors(runIdOrPrefix: string, limit = 200): SyncRunError[] {
+    const run = this.store.resolveRun(runIdOrPrefix);
+    return this.store.listSyncErrors(run.id, limit);
+  }
+
+  runSync(request: SyncRequest) {
+    return this.engine.sync(request);
+  }
+
+  /**
+   * Dry-run preflight used by the UI/API before the first real run. Samples a
+   * bounded number of rows so a broken mapping never touches the target.
+   */
+  validateSyncPipeline(idOrName: string, options: { limit?: number; batch_size?: number } = {}) {
+    const pipeline = this.store.requireSyncPipeline(idOrName);
+    return this.engine.sync({
+      pipeline_id: pipeline.id,
+      dry_run: true,
+      limit: Math.min(Math.max(options.limit ?? 100, 1), 5000),
+      ...(options.batch_size ? { batch_size: options.batch_size } : {}),
+    });
+  }
+
+  createSyncJob(input: {
+    name: string;
+    pipeline_id: string;
+    dry_run?: boolean;
+    limit?: number;
+    batch_size?: number;
+    on_error?: 'fail' | 'skip';
+    confirm?: string;
+    schedule?: ScheduleInput;
+  }): { job: JobRecord; schedule: ScheduleRecord | null } {
+    const pipeline = this.store.requireSyncPipeline(input.pipeline_id);
+    if (!input.name?.trim()) throw new UdmtError('INVALID_INPUT', 'Job name is required.');
+    const job = this.store.createJob({
+      name: input.name.trim(),
+      operation_type: 'sync',
+      source_connection_id: pipeline.source_connection_id,
+      target_connection_id: pipeline.target_connection_id,
+      storage_backend_id: null,
+      config: {
+        pipeline_id: pipeline.id,
+        ...(input.dry_run !== undefined ? { dry_run: input.dry_run } : {}),
+        ...(input.limit !== undefined ? { limit: input.limit } : {}),
+        ...(input.batch_size !== undefined ? { batch_size: input.batch_size } : {}),
+        ...(input.on_error !== undefined ? { on_error: input.on_error } : {}),
+        ...(input.confirm !== undefined ? { confirm: input.confirm } : {}),
+      },
+    });
+    const schedule = input.schedule ? this.addSchedule(job.id, input.schedule) : null;
+    return { job, schedule };
+  }
+
+  private normalizeSyncLoadMode(mode: SyncLoadMode): SyncLoadMode {
+    if (!SYNC_LOAD_MODES.includes(mode)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown sync load mode: ${String(mode)}`);
+    }
+    return mode === 'replace_resource' ? 'truncate_and_load' : mode;
+  }
+
+  private normalizeSyncMapping(mapping: SyncFieldMapping[]): SyncFieldMapping[] {
+    const seen = new Set<string>();
+    for (const entry of mapping) {
+      const source = entry.source?.trim();
+      const target = (entry.target ?? entry.source)?.trim();
+      if (!source || !target) {
+        throw new UdmtError('INVALID_INPUT', 'Every mapping entry needs a source and target field.');
+      }
+      if (seen.has(target)) {
+        throw new UdmtError('INVALID_INPUT', `Two mapping entries write the same target field "${target}".`);
+      }
+      seen.add(target);
+      if (entry.mask && !['email', 'full', 'last4'].includes(entry.mask)) {
+        throw new UdmtError('INVALID_INPUT', `Unknown mask "${String(entry.mask)}".`);
+      }
+    }
+    return mapping.map((entry) => ({ ...entry, source: entry.source.trim(), target: (entry.target ?? entry.source).trim() }));
+  }
+
+  private normalizeSyncKeys(mode: SyncLoadMode, keyColumns: string[], mapping: SyncFieldMapping[]): string[] {
+    const keys = [...new Set(keyColumns.map((key) => key.trim()).filter(Boolean))];
+    if (mode === 'upsert' && keys.length === 0) {
+      throw new UdmtError('INVALID_INPUT', 'Sync mode upsert requires at least one key column.');
+    }
+    if (keys.length > 0 && mapping.length > 0) {
+      const targets = new Set(mapping.map((entry) => (entry.target ?? entry.source).trim()));
+      const invalid = keys.filter((key) => !targets.has(key));
+      if (invalid.length > 0) {
+        throw new UdmtError('INVALID_INPUT', `Key columns are not mapped to the target: ${invalid.join(', ')}`);
+      }
+    }
+    return keys;
+  }
+
+  private normalizeSyncOptions(options: SyncOptions): SyncOptions {
+    if (options.batch_size !== undefined && (!Number.isInteger(options.batch_size) || options.batch_size < 1 || options.batch_size > 5000)) {
+      throw new UdmtError('INVALID_INPUT', 'Sync batch_size must be between 1 and 5000.');
+    }
+    if (options.limit !== undefined && (!Number.isInteger(options.limit) || options.limit < 1)) {
+      throw new UdmtError('INVALID_INPUT', 'Sync limit must be a positive integer.');
+    }
+    if (options.filter && !options.filter.column) {
+      throw new UdmtError('INVALID_INPUT', 'Sync filter needs a column.');
+    }
+    if (options.filter?.operator === 'in' && !Array.isArray(options.filter.value)) {
+      throw new UdmtError('INVALID_INPUT', 'Sync filter operator "in" needs an array value.');
+    }
+    return options;
   }
 
   // ------------------------------------------------------------------ jobs & schedules

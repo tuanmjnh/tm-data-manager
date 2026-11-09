@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { UdmtError, toUdmtError } from '../core/errors.js';
 import type { UdmtApp } from '../core/service.js';
 import { nowIso } from '../core/utils.js';
-import type { ExportRequest, ImportRequest } from '../core/types.js';
+import type { ExportRequest, ImportRequest, SyncRequest } from '../core/types.js';
 
 export interface ApiServerHandle {
   url: string;
@@ -237,6 +237,54 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
     const cancelMatch = /^\/api\/runs\/([^/]+)\/cancel$/.exec(path);
     if (cancelMatch && method === 'POST') {
       return sendJson(res, 200, app.cancelRun(app.getRun(decodeURIComponent(cancelMatch[1]!)).id));
+    }
+
+    const runErrorsMatch = /^\/api\/runs\/([^/]+)\/errors$/.exec(path);
+    if (runErrorsMatch && method === 'GET') {
+      return sendJson(res, 200, app.syncErrors(decodeURIComponent(runErrorsMatch[1]!), Number(parsed.searchParams.get('limit') ?? 200)));
+    }
+
+    if (path === '/api/sync/pipelines' && method === 'GET') {
+      return sendJson(res, 200, app.listSyncPipelines());
+    }
+    if (path === '/api/sync/pipelines' && method === 'POST') {
+      const body = await readJson(req);
+      return sendJson(res, 201, app.createSyncPipeline(body as never));
+    }
+
+    const syncPipelineMatch = /^\/api\/sync\/pipelines\/([^/]+)$/.exec(path);
+    if (syncPipelineMatch && method === 'GET') {
+      const pipeline = app.getSyncPipeline(decodeURIComponent(syncPipelineMatch[1]!));
+      return sendJson(res, 200, { pipeline, state: app.syncState(pipeline.id) });
+    }
+    if (syncPipelineMatch && method === 'PATCH') {
+      const body = await readJson(req);
+      return sendJson(res, 200, app.updateSyncPipeline(decodeURIComponent(syncPipelineMatch[1]!), body as never));
+    }
+    if (syncPipelineMatch && method === 'DELETE') {
+      app.deleteSyncPipeline(decodeURIComponent(syncPipelineMatch[1]!));
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const syncRunMatch = /^\/api\/sync\/pipelines\/([^/]+)\/run$/.exec(path);
+    if (syncRunMatch && method === 'POST') {
+      const body = (await readJson(req)) as Omit<SyncRequest, 'pipeline_id'>;
+      const pipeline = app.getSyncPipeline(decodeURIComponent(syncRunMatch[1]!));
+      const started = app.engine.startSync({ ...body, pipeline_id: pipeline.id });
+      void started.done;
+      return sendJson(res, 202, started.run);
+    }
+
+    const syncValidateMatch = /^\/api\/sync\/pipelines\/([^/]+)\/validate$/.exec(path);
+    if (syncValidateMatch && method === 'POST') {
+      const body = (await readJson(req)) as { limit?: number; batch_size?: number };
+      const result = await app.validateSyncPipeline(decodeURIComponent(syncValidateMatch[1]!), body ?? {});
+      return sendJson(res, 200, result.run);
+    }
+
+    const syncStateMatch = /^\/api\/sync\/pipelines\/([^/]+)\/state$/.exec(path);
+    if (syncStateMatch && method === 'GET') {
+      return sendJson(res, 200, app.syncState(decodeURIComponent(syncStateMatch[1]!)));
     }
 
     if (path === '/api/artifacts' && method === 'GET') {

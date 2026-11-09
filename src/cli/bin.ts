@@ -6,7 +6,7 @@ import { UdmtError, toUdmtError } from '../core/errors.js';
 import { APP_VERSION } from '../core/utils.js';
 import { WorkerRuntime } from '../core/worker.js';
 import { startApiServer } from '../api/server.js';
-import type { ExportFormat, ImportRequest, OperationRun } from '../core/types.js';
+import type { ExportFormat, ImportRequest, OperationRun, SyncFieldMapping, SyncLoadMode, SyncOptions } from '../core/types.js';
 import {
   EXIT,
   RESET,
@@ -866,6 +866,244 @@ storage
     });
   });
 
+// ------------------------------------------------------------------ sync
+const sync = program.command('sync').description('Manage and run source→target sync pipelines');
+const syncPipeline = sync.command('pipeline').description('Manage sync pipeline definitions');
+
+function parseJsonOption<T>(value: unknown, label: string): T | undefined {
+  if (value === undefined || value === null || value === '') return undefined;
+  try {
+    return JSON.parse(String(value)) as T;
+  } catch {
+    throw new UdmtError('INVALID_INPUT', `${label} must be valid JSON.`);
+  }
+}
+
+function printSyncRun(run: OperationRun): void {
+  if (globalOptions().json) return printJson(run);
+  const result = run.result ?? {};
+  process.stdout.write(`${result.dry_run ? 'Sync dry run finished — nothing was written.' : 'Sync completed.'}\n`);
+  process.stdout.write(`  run:      ${run.id}\n`);
+  process.stdout.write(`  status:   ${run.status}\n`);
+  if (result.dry_run) {
+    process.stdout.write(`  sampled:  ${result.rows_sampled ?? 0}\n`);
+    process.stdout.write(`  matched:  ${result.rows_matched ?? 0}\n`);
+  } else {
+    process.stdout.write(`  read:     ${result.rows_read ?? 0}\n`);
+    process.stdout.write(`  filtered: ${result.rows_filtered ?? 0}\n`);
+    process.stdout.write(`  written:  ${result.rows_written ?? 0}\n`);
+    process.stdout.write(`  skipped:  ${result.rows_skipped ?? 0}\n`);
+  }
+  process.stdout.write(`  errors:   ${result.errors ?? 0}\n`);
+  for (const warning of ((result.warnings as string[] | undefined) ?? []).slice(0, 20)) {
+    process.stdout.write(`  warning:  ${warning}\n`);
+  }
+}
+
+syncPipeline
+  .command('list')
+  .description('List sync pipelines')
+  .action(async () => {
+    await withApp((app) => {
+      const rows = app.listSyncPipelines();
+      if (globalOptions().json) return printJson(rows);
+      printTable(
+        rows.map((row) => ({
+          id: row.id.slice(0, 8),
+          name: row.name,
+          mode: row.load_mode,
+          source: row.source_resource,
+          target: row.target_resource,
+          enabled: row.enabled,
+          updated: row.updated_at,
+        })),
+        ['id', 'name', 'mode', 'source', 'target', 'enabled', 'updated'],
+      );
+    });
+  });
+
+syncPipeline
+  .command('inspect')
+  .argument('<pipeline>')
+  .description('Show a sync pipeline definition and its last state')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const row = app.getSyncPipeline(idOrName);
+      const state = app.syncState(row.id);
+      if (globalOptions().json) return printJson({ pipeline: row, state });
+      process.stdout.write(`${row.name} (${row.id}) — ${row.load_mode}\n`);
+      process.stdout.write(`source:  ${row.source_connection_id}.${row.source_resource}\n`);
+      process.stdout.write(`target:  ${row.target_connection_id}.${row.target_resource}\n`);
+      process.stdout.write(`keys:    ${row.key_columns.join(', ') || '—'}\n`);
+      process.stdout.write(`enabled: ${row.enabled ? 'yes' : 'no'}\n`);
+      process.stdout.write(`mapping: ${JSON.stringify(row.mapping, null, 2)}\n`);
+      process.stdout.write(`options: ${JSON.stringify(row.options, null, 2)}\n`);
+      if (state) {
+        process.stdout.write(`last run: ${state.last_status ?? '—'} @ ${state.last_run_at ?? '—'} (${state.rows_synced} rows total)\n`);
+      }
+    });
+  });
+
+function syncDefinitionFromFlags(options: Record<string, unknown>) {
+  return {
+    ...(options.name ? { name: String(options.name) } : {}),
+    ...(options.sourceConn ? { source_connection_id: String(options.sourceConn) } : {}),
+    ...(options.targetConn ? { target_connection_id: String(options.targetConn) } : {}),
+    ...(options.sourceResource ? { source_resource: String(options.sourceResource) } : {}),
+    ...(options.targetResource ? { target_resource: String(options.targetResource) } : {}),
+    ...(options.mode ? { load_mode: String(options.mode) as SyncLoadMode } : {}),
+    ...(options.keyColumns ? { key_columns: parseKeyColumns(String(options.keyColumns)) } : {}),
+    ...(options.mapping ? { mapping: parseJsonOption<SyncFieldMapping[]>(options.mapping, '--mapping') } : {}),
+    ...(options.options ? { options: parseJsonOption<SyncOptions>(options.options, '--options') } : {}),
+    ...(options.disabled ? { enabled: false } : {}),
+  };
+}
+
+function addSyncDefinitionOptions(command: Command, required: boolean): Command {
+  const commandWithFlags = required
+    ? command
+        .requiredOption('--name <name>', 'pipeline name')
+        .requiredOption('--source-conn <connection>', 'source connection')
+        .requiredOption('--target-conn <connection>', 'target connection')
+        .requiredOption('--source-resource <resource>', 'source table/collection/file')
+        .requiredOption('--target-resource <resource>', 'target table/collection/file')
+    : command
+        .option('--name <name>', 'pipeline name')
+        .option('--source-conn <connection>', 'source connection')
+        .option('--target-conn <connection>', 'target connection')
+        .option('--source-resource <resource>', 'source table/collection/file')
+        .option('--target-resource <resource>', 'target table/collection/file');
+  return commandWithFlags
+    .addOption(
+      new Option('--mode <mode>', 'load mode').choices(['append', 'upsert', 'truncate_and_load', 'replace_resource']).default(required ? 'append' : undefined),
+    )
+    .option('--key-columns <list>', 'upsert key target columns (comma separated)')
+    .option('--mapping <json>', 'field mapping JSON array, e.g. [{"source":"id","target":"id"}]')
+    .option('--options <json>', 'options JSON object (filter, batch_size, on_error, retry, dry_run, create_resource, limit)')
+    .option('--disabled', 'create the pipeline disabled');
+}
+
+addSyncDefinitionOptions(
+  syncPipeline.command('create').description('Create a sync pipeline'),
+  true,
+).action(async (options: Record<string, unknown>) => {
+  await main(async () => {
+    await withApp((app) => {
+      const created = app.createSyncPipeline(syncDefinitionFromFlags(options) as never);
+      if (globalOptions().json) return printJson(created);
+      process.stdout.write(`Created sync pipeline "${created.name}" (${created.id}).\n`);
+    });
+  });
+});
+
+addSyncDefinitionOptions(
+  syncPipeline.command('update').argument('<pipeline>').description('Update a sync pipeline'),
+  false,
+).action(async (idOrName: string, options: Record<string, unknown>) => {
+  await main(async () => {
+    await withApp((app) => {
+      const patch = syncDefinitionFromFlags(options);
+      const updated = app.updateSyncPipeline(idOrName, patch);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Updated sync pipeline "${updated.name}".\n`);
+    });
+  });
+});
+
+syncPipeline
+  .command('remove')
+  .argument('<pipeline>')
+  .description('Delete a sync pipeline')
+  .action(async (idOrName: string) => {
+    await main(async () => {
+      await withApp((app) => {
+        app.deleteSyncPipeline(idOrName);
+        process.stdout.write(`Deleted sync pipeline ${idOrName}.\n`);
+      });
+    });
+  });
+
+sync
+  .command('run')
+  .argument('<pipeline>')
+  .description('Run a sync pipeline')
+  .option('--dry-run', 'validate and sample without writing')
+  .option('--limit <n>', 'maximum source rows', (value) => Number(value))
+  .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
+  .addOption(new Option('--on-error <mode>', 'row error handling').choices(['fail', 'skip']))
+  .option('--confirm <target_connection_name>', 'required for destructive or production targets')
+  .action(async (idOrName: string, options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const pipeline = app.getSyncPipeline(idOrName);
+        const started = app.engine.startSync({
+          pipeline_id: pipeline.id,
+          ...(options.dryRun ? { dry_run: true } : {}),
+          ...(options.limit ? { limit: Number(options.limit) } : {}),
+          ...(options.batchSize ? { batch_size: Number(options.batchSize) } : {}),
+          ...(options.onError ? { on_error: options.onError as 'fail' | 'skip' } : {}),
+          ...(options.confirm ? { confirm: String(options.confirm) } : {}),
+        });
+        const run = assertSuccess(await watchRun(app, started.run.id));
+        printSyncRun(run);
+      });
+    });
+  });
+
+sync
+  .command('validate')
+  .argument('<pipeline>')
+  .description('Dry-run a pipeline against a bounded sample')
+  .option('--limit <n>', 'rows to sample', (value) => Number(value), 100)
+  .action(async (idOrName: string, options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const { run } = await app.validateSyncPipeline(idOrName, { limit: Number(options.limit ?? 100) });
+        const finished = assertSuccess(run);
+        printSyncRun(finished);
+      });
+    });
+  });
+
+sync
+  .command('state')
+  .argument('<pipeline>')
+  .description('Show checkpoint state for a pipeline')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const state = app.syncState(idOrName);
+      if (globalOptions().json) return printJson(state);
+      if (!state) return process.stdout.write('No sync state yet.\n');
+      process.stdout.write(`pipeline: ${state.pipeline_id}\n`);
+      process.stdout.write(`last run: ${state.last_run_id ?? '—'} (${state.last_status ?? '—'})\n`);
+      process.stdout.write(`updated:  ${state.updated_at}\n`);
+      process.stdout.write(`rows:     ${state.rows_synced}\n`);
+      process.stdout.write(`checkpoint: ${JSON.stringify(state.checkpoint, null, 2)}\n`);
+    });
+  });
+
+sync
+  .command('errors')
+  .argument('<run>')
+  .description('Show persisted row errors for a sync run')
+  .option('--limit <n>', 'maximum rows', (value) => Number(value), 200)
+  .action(async (runId: string, options: Record<string, unknown>) => {
+    await withApp((app) => {
+      const rows = app.syncErrors(runId, Number(options.limit ?? 200));
+      if (globalOptions().json) return printJson(rows);
+      if (rows.length === 0) return process.stdout.write('No sync row errors recorded.\n');
+      printTable(
+        rows.map((row) => ({
+          row: row.row_index ?? '—',
+          batch: row.batch_index ?? '—',
+          code: row.code,
+          message: row.message,
+        })),
+        ['row', 'batch', 'code', 'message'],
+      );
+    });
+  });
+
 // ------------------------------------------------------------------ jobs & schedules
 const job = program.command('job').description('Manage reusable jobs');
 
@@ -959,6 +1197,45 @@ job
           ...(options.format ? { format: options.format as ExportFormat } : {}),
           mode: options.mode as 'append' | 'upsert' | 'truncate_and_load',
           ...(options.keyColumns ? { key_columns: parseKeyColumns(String(options.keyColumns)) } : {}),
+          ...(options.confirm ? { confirm: String(options.confirm) } : {}),
+          ...(options.dryRun ? { dry_run: true } : {}),
+          ...(schedule ? { schedule } : {}),
+        });
+        if (globalOptions().json) return printJson(result);
+        process.stdout.write(`Created job "${result.job.name}" (${result.job.id}).\n`);
+        if (result.schedule?.next_run_at) process.stdout.write(`Next run: ${result.schedule.next_run_at}\n`);
+      });
+    });
+  });
+
+job
+  .command('add-sync')
+  .description('Create a sync job (optionally scheduled)')
+  .requiredOption('--name <name>')
+  .requiredOption('--pipeline <pipeline>')
+  .option('--limit <n>', 'maximum source rows', (value) => Number(value))
+  .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
+  .addOption(new Option('--on-error <mode>').choices(['fail', 'skip']))
+  .option('--confirm <target_connection_name>')
+  .option('--dry-run')
+  .option('--schedule <type>', 'once|interval|daily|weekly|monthly')
+  .option('--timezone <tz>', 'IANA timezone', 'UTC')
+  .option('--at <iso>', 'for --schedule once')
+  .option('--every-minutes <n>', 'interval in minutes', (value) => Number(value))
+  .option('--hour <n>', 'hour 0-23', (value) => Number(value))
+  .option('--minute <n>', 'minute 0-59', (value) => Number(value))
+  .option('--day <n>', 'monthly day', (value) => Number(value))
+  .option('--days <list>')
+  .action(async (options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp((app) => {
+        const schedule = buildScheduleInput(options);
+        const result = app.createSyncJob({
+          name: String(options.name),
+          pipeline_id: String(options.pipeline),
+          ...(options.limit ? { limit: Number(options.limit) } : {}),
+          ...(options.batchSize ? { batch_size: Number(options.batchSize) } : {}),
+          ...(options.onError ? { on_error: options.onError as 'fail' | 'skip' } : {}),
           ...(options.confirm ? { confirm: String(options.confirm) } : {}),
           ...(options.dryRun ? { dry_run: true } : {}),
           ...(schedule ? { schedule } : {}),

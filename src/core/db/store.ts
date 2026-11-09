@@ -13,6 +13,9 @@ import type {
   RunProgress,
   ScheduleRecord,
   StorageBackendRecord,
+  SyncPipelineRecord,
+  SyncRunError,
+  SyncStateRecord,
   WorkerInstance,
 } from '../types.js';
 
@@ -338,6 +341,171 @@ export class Store {
       nowIso(),
       id,
     );
+  }
+
+  // ---------------------------------------------------------------- sync
+  listSyncPipelines(): SyncPipelineRecord[] {
+    return this.db
+      .all<Record<string, unknown>>('SELECT * FROM sync_pipelines ORDER BY created_at DESC')
+      .map(mapSyncPipeline);
+  }
+
+  getSyncPipeline(idOrName: string): SyncPipelineRecord | undefined {
+    const row = this.db.get<Record<string, unknown>>(
+      'SELECT * FROM sync_pipelines WHERE id = ? OR name = ? LIMIT 1',
+      idOrName,
+      idOrName,
+    );
+    return row ? mapSyncPipeline(row) : undefined;
+  }
+
+  requireSyncPipeline(idOrName: string): SyncPipelineRecord {
+    const pipeline = this.getSyncPipeline(idOrName);
+    if (!pipeline) throw new UdmtError('NOT_FOUND', `Sync pipeline not found: ${idOrName}`);
+    return pipeline;
+  }
+
+  createSyncPipeline(input: Omit<SyncPipelineRecord, 'id' | 'created_at' | 'updated_at'>): SyncPipelineRecord {
+    const id = newId();
+    const now = nowIso();
+    this.db.run(
+      `INSERT INTO sync_pipelines
+       (id, name, source_connection_id, target_connection_id, source_resource, target_resource,
+        mapping_json, load_mode, key_columns_json, options_json, enabled, created_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+      id,
+      input.name,
+      input.source_connection_id,
+      input.target_connection_id,
+      input.source_resource,
+      input.target_resource,
+      JSON.stringify(input.mapping),
+      input.load_mode,
+      JSON.stringify(input.key_columns),
+      JSON.stringify(input.options),
+      input.enabled ? 1 : 0,
+      now,
+      now,
+    );
+    return this.requireSyncPipeline(id);
+  }
+
+  updateSyncPipeline(
+    id: string,
+    patch: Partial<Omit<SyncPipelineRecord, 'id' | 'created_at' | 'updated_at'>>,
+  ): SyncPipelineRecord {
+    const existing = this.requireSyncPipeline(id);
+    const next = {
+      name: patch.name ?? existing.name,
+      source_connection_id: patch.source_connection_id ?? existing.source_connection_id,
+      target_connection_id: patch.target_connection_id ?? existing.target_connection_id,
+      source_resource: patch.source_resource ?? existing.source_resource,
+      target_resource: patch.target_resource ?? existing.target_resource,
+      mapping: patch.mapping ?? existing.mapping,
+      load_mode: patch.load_mode ?? existing.load_mode,
+      key_columns: patch.key_columns ?? existing.key_columns,
+      options: patch.options ? { ...existing.options, ...patch.options } : existing.options,
+      enabled: patch.enabled ?? existing.enabled,
+    };
+    this.db.run(
+      `UPDATE sync_pipelines SET name = ?, source_connection_id = ?, target_connection_id = ?,
+        source_resource = ?, target_resource = ?, mapping_json = ?, load_mode = ?, key_columns_json = ?,
+        options_json = ?, enabled = ?, updated_at = ? WHERE id = ?`,
+      next.name,
+      next.source_connection_id,
+      next.target_connection_id,
+      next.source_resource,
+      next.target_resource,
+      JSON.stringify(next.mapping),
+      next.load_mode,
+      JSON.stringify(next.key_columns),
+      JSON.stringify(next.options),
+      next.enabled ? 1 : 0,
+      nowIso(),
+      id,
+    );
+    return this.requireSyncPipeline(id);
+  }
+
+  deleteSyncPipeline(id: string): void {
+    const pipeline = this.requireSyncPipeline(id);
+    this.db.run('DELETE FROM sync_pipelines WHERE id = ?', pipeline.id);
+  }
+
+  getSyncState(pipelineId: string): SyncStateRecord | undefined {
+    const row = this.db.get<Record<string, unknown>>('SELECT * FROM sync_states WHERE pipeline_id = ?', pipelineId);
+    return row ? mapSyncState(row) : undefined;
+  }
+
+  upsertSyncState(input: {
+    pipeline_id: string;
+    checkpoint: Record<string, unknown>;
+    last_run_id: string | null;
+    last_run_at: string | null;
+    last_status: OperationStatus | null;
+    rows_synced: number;
+  }): SyncStateRecord {
+    this.db.run(
+      `INSERT INTO sync_states (pipeline_id, checkpoint_json, last_run_id, last_run_at, last_status, rows_synced, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)
+       ON CONFLICT(pipeline_id) DO UPDATE SET
+         checkpoint_json = excluded.checkpoint_json,
+         last_run_id = excluded.last_run_id,
+         last_run_at = excluded.last_run_at,
+         last_status = excluded.last_status,
+         rows_synced = excluded.rows_synced,
+         updated_at = excluded.updated_at`,
+      input.pipeline_id,
+      JSON.stringify(input.checkpoint),
+      input.last_run_id,
+      input.last_run_at,
+      input.last_status,
+      input.rows_synced,
+      nowIso(),
+    );
+    const state = this.getSyncState(input.pipeline_id);
+    if (!state) throw new UdmtError('OPERATION_FAILED', `Sync state missing after write: ${input.pipeline_id}`);
+    return state;
+  }
+
+  recordSyncError(input: {
+    run_id: string;
+    pipeline_id: string | null;
+    batch_index: number | null;
+    row_index: number | null;
+    code: string;
+    message: string;
+  }): void {
+    this.db.run(
+      `INSERT INTO sync_run_errors (run_id, pipeline_id, batch_index, row_index, code, message, created_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      input.run_id,
+      input.pipeline_id,
+      input.batch_index,
+      input.row_index,
+      input.code,
+      input.message,
+      nowIso(),
+    );
+  }
+
+  clearSyncErrors(runId: string): void {
+    this.db.run('DELETE FROM sync_run_errors WHERE run_id = ?', runId);
+  }
+
+  listSyncErrors(runId: string, limit = 200): SyncRunError[] {
+    return this.db
+      .all<Record<string, unknown>>(
+        'SELECT * FROM sync_run_errors WHERE run_id = ? ORDER BY id ASC LIMIT ?',
+        runId,
+        Math.min(Math.max(limit, 1), 1000),
+      )
+      .map(mapSyncError);
+  }
+
+  countSyncErrors(runId: string): number {
+    const row = this.db.get<{ n: number }>('SELECT COUNT(*) AS n FROM sync_run_errors WHERE run_id = ?', runId);
+    return Number(row?.n ?? 0);
   }
 
   // ---------------------------------------------------------------- runs
@@ -932,6 +1100,49 @@ function mapArtifact(row: ArtifactRow): ArtifactRecord {
     created_at: row.created_at,
     expires_at: row.expires_at,
     pinned: Boolean(row.pinned),
+  };
+}
+
+function mapSyncPipeline(row: Record<string, unknown>): SyncPipelineRecord {
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    source_connection_id: String(row.source_connection_id),
+    target_connection_id: String(row.target_connection_id),
+    source_resource: String(row.source_resource),
+    target_resource: String(row.target_resource),
+    mapping: json<SyncPipelineRecord['mapping']>(row.mapping_json as string, []),
+    load_mode: String(row.load_mode) as SyncPipelineRecord['load_mode'],
+    key_columns: json<string[]>(row.key_columns_json as string | null, []),
+    options: json<SyncPipelineRecord['options']>(row.options_json as string, {}),
+    enabled: Boolean(row.enabled),
+    created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapSyncState(row: Record<string, unknown>): SyncStateRecord {
+  return {
+    pipeline_id: String(row.pipeline_id),
+    checkpoint: json<Record<string, unknown>>(row.checkpoint_json as string, {}),
+    last_run_id: (row.last_run_id as string | null) ?? null,
+    last_run_at: (row.last_run_at as string | null) ?? null,
+    last_status: (row.last_status as OperationStatus | null) ?? null,
+    rows_synced: Number(row.rows_synced ?? 0),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapSyncError(row: Record<string, unknown>): SyncRunError {
+  return {
+    id: Number(row.id),
+    run_id: String(row.run_id),
+    pipeline_id: (row.pipeline_id as string | null) ?? null,
+    batch_index: row.batch_index === null || row.batch_index === undefined ? null : Number(row.batch_index),
+    row_index: row.row_index === null || row.row_index === undefined ? null : Number(row.row_index),
+    code: String(row.code),
+    message: String(row.message),
+    created_at: String(row.created_at),
   };
 }
 

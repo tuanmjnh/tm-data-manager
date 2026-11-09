@@ -195,7 +195,7 @@ export type ExportFormat = 'jsonl' | 'csv' | 'json';
 export const EXPORT_FORMATS: ExportFormat[] = ['jsonl', 'csv', 'json'];
 export type Compression = 'none' | 'gzip';
 
-export type OperationType = 'export' | 'import' | 'verify';
+export type OperationType = 'export' | 'import' | 'verify' | 'sync';
 export type OperationStatus =
   | 'queued'
   | 'preparing'
@@ -307,6 +307,102 @@ export interface JobRecord {
   enabled: boolean;
   created_at: string;
   updated_at: string;
+}
+
+export type SyncLoadMode = 'append' | 'upsert' | 'truncate_and_load' | 'replace_resource';
+export const SYNC_LOAD_MODES: SyncLoadMode[] = ['append', 'upsert', 'truncate_and_load', 'replace_resource'];
+
+export type SyncFilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'in' | 'is_null' | 'not_null';
+export const SYNC_FILTER_OPERATORS: SyncFilterOperator[] = [
+  'eq',
+  'neq',
+  'gt',
+  'gte',
+  'lt',
+  'lte',
+  'contains',
+  'in',
+  'is_null',
+  'not_null',
+];
+
+export interface SyncFilter {
+  column: string;
+  operator: SyncFilterOperator;
+  value?: unknown;
+}
+
+export type SyncMask = 'email' | 'full' | 'last4';
+export const SYNC_MASKS: SyncMask[] = ['email', 'full', 'last4'];
+
+/** One source→target field rule. `target` defaults to the source field name. */
+export interface SyncFieldMapping {
+  source: string;
+  target?: string;
+  /** Canonical type for the written value; defaults to the source column type. */
+  cast?: CanonicalType;
+  default?: unknown;
+  trim?: boolean;
+  mask?: SyncMask;
+  value_map?: Record<string, string>;
+}
+
+export interface SyncOptions {
+  filter?: SyncFilter | null;
+  batch_size?: number;
+  on_error?: 'fail' | 'skip';
+  /** Full-pipeline retry is only allowed for idempotent load modes (upsert/replace). */
+  retry?: { max_attempts?: number; backoff_ms?: number };
+  dry_run?: boolean;
+  confirm?: string;
+  create_resource?: boolean;
+  limit?: number;
+}
+
+export interface SyncRequest {
+  pipeline_id: string;
+  dry_run?: boolean;
+  confirm?: string;
+  limit?: number;
+  batch_size?: number;
+  on_error?: 'fail' | 'skip';
+}
+
+export interface SyncPipelineRecord {
+  id: string;
+  name: string;
+  source_connection_id: string;
+  target_connection_id: string;
+  source_resource: string;
+  target_resource: string;
+  mapping: SyncFieldMapping[];
+  load_mode: SyncLoadMode;
+  key_columns: string[];
+  options: SyncOptions;
+  enabled: boolean;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface SyncStateRecord {
+  pipeline_id: string;
+  checkpoint: Record<string, unknown>;
+  last_run_id: string | null;
+  last_run_at: string | null;
+  last_status: OperationStatus | null;
+  rows_synced: number;
+  updated_at: string;
+}
+
+export interface SyncRunError {
+  id: number;
+  run_id: string;
+  pipeline_id: string | null;
+  batch_index: number | null;
+  row_index: number | null;
+  code: string;
+  message: string;
+  created_at: string;
 }
 
 export type StorageBackendType = 'local' | 's3';

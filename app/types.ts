@@ -93,7 +93,7 @@ export interface RunProgress {
 export interface OperationRun {
   id: string
   job_id: string | null
-  operation_type: 'export' | 'import' | 'verify'
+  operation_type: 'export' | 'import' | 'verify' | 'sync'
   status: string
   source_connection_id: string | null
   target_connection_id: string | null
@@ -173,6 +173,76 @@ export interface StorageTestResult {
   diagnostics: string[]
   endpoint_hint: string | null
   tested_at: string
+}
+
+export type SyncLoadMode = 'append' | 'upsert' | 'truncate_and_load' | 'replace_resource'
+
+export type SyncFilterOperator = 'eq' | 'neq' | 'gt' | 'gte' | 'lt' | 'lte' | 'contains' | 'in' | 'is_null' | 'not_null'
+
+export interface SyncFilter {
+  column: string
+  operator: SyncFilterOperator
+  value?: unknown
+}
+
+export type SyncMask = 'email' | 'full' | 'last4'
+
+export interface SyncFieldMapping {
+  source: string
+  target?: string
+  cast?: string
+  default?: unknown
+  trim?: boolean
+  mask?: SyncMask
+  value_map?: Record<string, string>
+}
+
+export interface SyncOptions {
+  filter?: SyncFilter | null
+  batch_size?: number
+  on_error?: 'fail' | 'skip'
+  retry?: { max_attempts?: number; backoff_ms?: number }
+  dry_run?: boolean
+  confirm?: string
+  create_resource?: boolean
+  limit?: number
+}
+
+export interface SyncPipeline {
+  id: string
+  name: string
+  source_connection_id: string
+  target_connection_id: string
+  source_resource: string
+  target_resource: string
+  mapping: SyncFieldMapping[]
+  load_mode: SyncLoadMode
+  key_columns: string[]
+  options: SyncOptions
+  enabled: boolean
+  created_at: string
+  updated_at: string
+}
+
+export interface SyncState {
+  pipeline_id: string
+  checkpoint: Record<string, unknown>
+  last_run_id: string | null
+  last_run_at: string | null
+  last_status: string | null
+  rows_synced: number
+  updated_at: string
+}
+
+export interface SyncRunError {
+  id: number
+  run_id: string
+  pipeline_id: string | null
+  batch_index: number | null
+  row_index: number | null
+  code: string
+  message: string
+  created_at: string
 }
 
 export interface LogEntry {

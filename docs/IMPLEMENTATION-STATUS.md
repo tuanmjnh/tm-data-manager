@@ -214,6 +214,104 @@ STATUS: completed (tested against a real local HTTP endpoint; no live cloud acco
 ```
 
 ```
+PHASE: 5 — Data Sync Engine
+STATUS: completed for database providers (SQLite→SQLite verified end-to-end; other providers reuse the
+same contract but were not run against live servers here)
+
+1. Implemented
+- Sync pipeline definition: source/target connection + resource, field mapping, load mode
+  (`append`, `upsert`, `truncate_and_load`, `replace_resource`), key columns, filter, batch size,
+  row-error policy, retry policy, row limit, target resource creation flag and an enabled switch.
+- Mapping/transform pipeline (pure module): implicit name mapping or explicit rules; source type
+  inheritance; explicit `cast`; `default`, `trim`, `mask` (`email`/`full`/`last4`) and `value_map`;
+  dotted paths for nested JSON values. Lossy casts fail with `CAST_FAILED` instead of writing a
+  corrupted value (e.g. `12.5` → integer, integers beyond JS safe range, non-boolean strings).
+- Filter operators: `eq`, `neq`, `gt`, `gte`, `lt`, `lte`, `contains`, `in`, `is_null`, `not_null`.
+- Engine preflight: source must declare `read_data` + `schema_read`, target `write_data`; both
+  connections must be active and the pipeline enabled. Source schema drives the mapping; a target
+  schema (when readable) produces missing-column/unknown-type warnings.
+- Streaming batch load through the existing provider `readRows`/`writeRows` contract, so the engine
+  stays provider-agnostic. Progress, logs, cancellation and terminal status use the existing durable
+  run machinery.
+- Safety: `truncate_and_load` (and the `replace_resource` alias) requires `--confirm
+  <target_connection_name>`; any non-append load into a connection marked `production` requires the
+  same confirmation. A rejected preflight never truncates. Full-pipeline retry is limited to
+  idempotent modes (`upsert`/`truncate_and_load`) and transient failures; `append` is never retried.
+- Error reporting: `on_error=fail` stops at the first bad row with `SYNC_ROW_ERROR`; `on_error=skip`
+  persists each bad row (row index, code, sanitized message, capped at 500 per run) and finishes
+  `completed_with_warnings`.
+- Checkpoint/state: `sync_states` stores the last run, status, cumulative row count and a
+  `checkpoint_version: 1`, `kind: full` snapshot; failures persist a `partial` snapshot without
+  masking the original error. Full sync only — resumable cursors/watermarks are Phase 8.
+- Dry run: samples up to 1,000 source rows, applies filter + transforms, reports matched rows and
+  error samples, writes nothing and does not change checkpoint state.
+- Surfaces: `UdmtApp` facade, worker execution of `operation_type: sync`, CLI `sync pipeline
+  list|inspect|create|update|remove`, `sync run|validate|state|errors`, `job add-sync` (schedulable),
+  REST endpoints under `/api/sync/pipelines` and `/api/runs/:id/errors`, and a GUI Sync page
+  (list/create/edit/delete, dry-run validation, confirmed real run, live polling, state/checkpoint
+  and row-error drawer) with en/vi locales.
+
+2. Files changed
+- `src/core/types.ts`, `src/core/errors.ts`, `src/core/state-machine.ts`,
+  `src/core/sync/pipeline.ts` (new), `src/core/operation/engine.ts`, `src/core/service.ts`,
+  `src/core/worker.ts`, `src/core/db/{migrations,store}.ts`, `src/cli/bin.ts`, `src/api/server.ts`,
+  `app/{pages/sync.vue,types.ts,layouts/default.vue,i18n/locales/*}`,
+  `tests/unit/sync-pipeline.test.ts` (new), `tests/integration/sync.test.ts` (new),
+  `docs/architecture/data-sync.md` (new), this file, `docs/database/schema-and-migrations.md`.
+
+3. Database migrations
+- v4 `sync-engine` adds `sync_pipelines`, `sync_states` and `sync_run_errors` with source/target and
+  run error indexes. All three cascade from their parent rows; no existing table is rewritten.
+
+4. Tests executed
+- `pnpm run typecheck` clean; `pnpm test` 66/66 passing; `pnpm run check:i18n` clean (en/vi parity);
+  `pnpm --filter udmt-gui run build` succeeds.
+- Unit (8): implicit mapping, unknown-source/duplicate-target rejection, target column/key metadata,
+  deterministic transform order, lossy-cast rejection, masking, dotted path reads, all filter
+  operators.
+- Integration (7, real SQLite files and real metadata DB): append creates the target and copies 250
+  rows; mapping+trim+cast+mask+filter writes the expected values; upsert idempotency and
+  `truncate_and_load` confirmation (failed preflight leaves prior data intact); `on_error=skip`
+  persists one `CAST_FAILED` row error and reports warnings; `on_error=fail` fails at row 251; dry
+  run samples 25 rows without creating the target or checkpoint; key columns outside the mapping are
+  rejected.
+
+5. Manual verification
+- Real CLI round trip in a temporary data dir: SQLite source (120 rows) → SQLite target with
+  mapping (trim/mask/cast), filter `age >= 30`, batch size 25, upsert on `id`. Dry run sampled 40 /
+  matched 30; the real run read 120, filtered 30, wrote 90; the target held 90 rows with masked
+  emails, trimmed names and `min(age)=30`; `sync state` showed a `kind: full` checkpoint.
+- `truncate_and_load` without `--confirm dst` exited 2 with `CONFIRMATION_REQUIRED` and kept the
+  existing 90 rows; the confirmed rerun completed and left 90 rows.
+- Scheduled path: `job add-sync --schedule once` + `worker once` produced a real `sync` run with
+  status `completed` and 100% progress in `operation list`.
+- This manual pass found and fixed a real CLI bug: `--options` JSON was read from the wrong commander
+  property, so filters/batch options were silently dropped. Fixed to `options.options`; re-verified
+  with the filter run above.
+
+6. Known limitations / risks
+- Only SQLite→SQLite was exercised end-to-end. PostgreSQL/MySQL/MariaDB/MongoDB sync goes through the
+  same contract but was not run against live servers in this environment.
+- Full sync only. The checkpoint is a run summary, not a resumable cursor; a failed run leaves
+  `partial` state but never resumes automatically. Incremental watermarks/CDC are Phase 8.
+- `replace_resource` is accepted by CLI/API/GUI and normalized to `truncate_and_load` (same
+  truncate+load behaviour, no drop/recreate).
+- Upsert semantics depend on the target provider's `writeRows` implementation and require a real
+  unique/primary key; there is no conflict-resolution policy.
+- Target column creation is delegated to the provider (`create_resource`, default true); missing
+  columns are warnings and may fail at write time if the provider cannot add them.
+- Retry does not roll back already-written batches; it is only enabled for idempotent modes.
+- Row errors are persisted up to 500 per run; the remainder is reported as a warning count.
+- The GUI mapping editor is JSON text (not a drag-and-drop builder), and requires a source schema to
+  exist for name validation.
+- No live cloud/provider test for sync; production confirmation covers misconfiguration, not data
+  correctness.
+
+7. Next recommended phase
+- Phase 6 — File/API connectors.
+```
+
+```
 PHASE: GUI (roadmap section 14, delivered with Phase 1–3)
 STATUS: completed for the implemented features
 

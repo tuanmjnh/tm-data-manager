@@ -1,6 +1,7 @@
 import { existsSync } from 'node:fs';
 import { mkdir, rm, readFile, writeFile, rename } from 'node:fs/promises';
 import { basename, dirname, extname, join, resolve } from 'node:path';
+import { setTimeout as sleep } from 'node:timers/promises';
 import { z } from 'zod';
 import { UdmtError, isUdmtError, toUdmtError, sanitizeErrorMessage } from '../errors.js';
 import type { AppPaths } from '../paths.js';
@@ -12,6 +13,14 @@ import { hasCapability, inferType } from '../providers/contract.js';
 import type { LocalStorageBackend } from '../storage/local.js';
 import type { StorageBackend } from '../storage/contract.js';
 import { createFormatWriter, defaultExtension, detectFormat, readRowsFromFile, type FormatWriter } from '../formats/index.js';
+import {
+  SyncRowError,
+  compileSyncMapping,
+  evaluateSyncFilter,
+  syncTargetColumns,
+  transformSyncRow,
+  type CompiledSyncField,
+} from '../sync/pipeline.js';
 import { assertSafePath, assertSafeSegment } from '../paths.js';
 import { APP_VERSION, fileSize, newId, nowIso, sanitizeName, sha256File, timestampForFilename, truncate } from '../utils.js';
 import type {
@@ -26,6 +35,8 @@ import type {
   OperationStatus,
   RunProgress,
   RowBatch,
+  SyncPipelineRecord,
+  SyncRequest,
 } from '../types.js';
 import { EXPORT_FORMATS } from '../types.js';
 
@@ -53,6 +64,15 @@ const ImportSchema = z.object({
   dry_run: z.boolean().optional(),
   confirm: z.string().optional(),
   create_resource: z.boolean().optional(),
+});
+
+const SyncSchema = z.object({
+  pipeline_id: z.string().min(1),
+  dry_run: z.boolean().optional(),
+  confirm: z.string().optional(),
+  limit: z.number().int().positive().optional(),
+  batch_size: z.number().int().min(1).max(5000).optional(),
+  on_error: z.enum(['fail', 'skip']).optional(),
 });
 
 export interface EngineDeps {
@@ -607,6 +627,428 @@ export class OperationEngine {
     }
   }
 
+  // ------------------------------------------------------------------ sync
+  startSync(request: SyncRequest, options: { jobId?: string | null; workerId?: string | null } = {}): StartedOperation {
+    const parsed = SyncSchema.safeParse(request);
+    if (!parsed.success) {
+      throw new UdmtError('INVALID_INPUT', `Sync request is invalid: ${parsed.error.issues.map((i) => i.message).join('; ')}`);
+    }
+    const req = parsed.data;
+    const { store } = this.deps;
+    const pipeline = store.requireSyncPipeline(req.pipeline_id);
+    if (!pipeline.enabled) {
+      throw new UdmtError('PRECONDITION_FAILED', `Sync pipeline "${pipeline.name}" is disabled.`);
+    }
+    const source = store.requireConnection(pipeline.source_connection_id);
+    const target = store.requireConnection(pipeline.target_connection_id);
+    if (!source.is_active) throw new UdmtError('PRECONDITION_FAILED', `Source connection "${source.name}" is disabled.`);
+    if (!target.is_active) throw new UdmtError('PRECONDITION_FAILED', `Target connection "${target.name}" is disabled.`);
+    const run = store.createRun({
+      operation_type: 'sync',
+      status: 'queued',
+      source_connection_id: source.id,
+      target_connection_id: target.id,
+      source_label: source.name,
+      target_label: target.name,
+      resource: `${pipeline.source_resource} → ${pipeline.target_resource}`,
+      config: { ...req, pipeline_id: pipeline.id, pipeline_name: pipeline.name },
+      job_id: options.jobId ?? null,
+      worker_instance_id: options.workerId ?? null,
+    });
+    const controller = new AbortController();
+    this.controllers.set(run.id, controller);
+    const done = this.executeSync(run, req, pipeline, controller).finally(() => this.controllers.delete(run.id));
+    return { run, done };
+  }
+
+  async sync(request: SyncRequest): Promise<{ run: OperationRun }> {
+    const started = this.startSync(request);
+    const run = await started.done;
+    if (run.status !== 'completed' && run.status !== 'completed_with_warnings') {
+      throw new UdmtError(
+        (run.error_code as never) ?? 'OPERATION_FAILED',
+        run.error_message_safe ?? `Sync finished with status ${run.status}`,
+        { details: { run_id: run.id } },
+      );
+    }
+    return { run };
+  }
+
+  private async executeSync(
+    run: OperationRun,
+    req: z.infer<typeof SyncSchema>,
+    pipeline: SyncPipelineRecord,
+    controller: AbortController,
+  ): Promise<OperationRun> {
+    const { store, registry, secrets } = this.deps;
+    const ctx = this.makeContext(run, controller);
+    const stats = {
+      rows_read: 0,
+      rows_filtered: 0,
+      rows_written: 0,
+      rows_skipped: 0,
+      transformed: 0,
+      errors: 0,
+      errors_persisted: 0,
+      attempts: 0,
+    };
+    const MAX_PERSISTED_ERRORS = 500;
+
+    const recordRowError = (rowIndex: number, error: unknown): void => {
+      const code = error instanceof SyncRowError ? error.code : 'TRANSFORM_FAILED';
+      const message = truncate(sanitizeErrorMessage((error as Error).message ?? String(error)), 500);
+      stats.errors += 1;
+      if (stats.errors_persisted < MAX_PERSISTED_ERRORS) {
+        store.recordSyncError({
+          run_id: run.id,
+          pipeline_id: pipeline.id,
+          batch_index: null,
+          row_index: rowIndex,
+          code,
+          message,
+        });
+        stats.errors_persisted += 1;
+      }
+      ctx.log('warn', `Row ${rowIndex} skipped (${code}): ${message}`);
+    };
+
+    try {
+      store.updateRunStatus(run.id, 'preparing', { stage: 'preparing', started_at: nowIso() });
+      const source = store.requireConnection(pipeline.source_connection_id);
+      const target = store.requireConnection(pipeline.target_connection_id);
+      const sourceProvider = registry.get(source.provider_id);
+      const targetProvider = registry.get(target.provider_id);
+      const sourceSecret = secrets.load(source.credential_ref);
+      const targetSecret = secrets.load(target.credential_ref);
+      const sourceDescriptor = sourceProvider.descriptor();
+      const targetDescriptor = targetProvider.descriptor();
+
+      if (!hasCapability(sourceDescriptor, 'read_data')) {
+        throw new UdmtError('CAPABILITY_UNSUPPORTED', `Source provider "${source.provider_id}" cannot read data.`);
+      }
+      if (!hasCapability(targetDescriptor, 'write_data')) {
+        throw new UdmtError('CAPABILITY_UNSUPPORTED', `Target provider "${target.provider_id}" cannot write data.`);
+      }
+      if (!hasCapability(sourceDescriptor, 'schema_read')) {
+        throw new UdmtError('CAPABILITY_UNSUPPORTED', `Source provider "${source.provider_id}" cannot read schema.`);
+      }
+
+      const sourceValidated = sourceProvider.validateConfig(source.config, sourceSecret);
+      const targetValidated = targetProvider.validateConfig(target.config, targetSecret);
+      const sourceSchema = await sourceProvider.readSchema!(sourceValidated.config, sourceSecret, pipeline.source_resource, ctx);
+      const targetSchema = hasCapability(targetDescriptor, 'schema_read')
+        ? await targetProvider
+            .readSchema!(targetValidated.config, targetSecret, pipeline.target_resource, ctx)
+            .catch(() => undefined)
+        : undefined;
+
+      const fields = compileSyncMapping(pipeline.mapping, sourceSchema.columns);
+      const targetColumns = syncTargetColumns(fields, pipeline.key_columns);
+      const normalizedMode = pipeline.load_mode === 'replace_resource' ? 'truncate_and_load' : pipeline.load_mode;
+      const destructive = normalizedMode === 'truncate_and_load';
+
+      if (normalizedMode === 'upsert' && pipeline.key_columns.length === 0) {
+        throw new UdmtError('INVALID_INPUT', 'Sync mode upsert requires at least one key column.');
+      }
+      const targetNames = new Set(fields.map((field) => field.target));
+      const invalidKeys = pipeline.key_columns.filter((key) => !targetNames.has(key));
+      if (invalidKeys.length > 0) {
+        throw new UdmtError('INVALID_INPUT', `Key columns are not mapped to the target: ${invalidKeys.join(', ')}`);
+      }
+      const filter = pipeline.options.filter ?? null;
+      if (filter) {
+        const sourceNames = new Set(sourceSchema.columns.map((column) => column.name));
+        if (!sourceNames.has(filter.column)) {
+          throw new UdmtError('INVALID_INPUT', `Filter column "${filter.column}" is not in the source schema.`);
+        }
+        if (filter.operator === 'in' && !Array.isArray(filter.value)) {
+          throw new UdmtError('INVALID_INPUT', 'Filter operator "in" needs an array value.');
+        }
+      }
+
+      const dryRun = req.dry_run ?? pipeline.options.dry_run ?? false;
+      if (!dryRun) {
+        if (destructive && req.confirm !== target.name) {
+          throw new UdmtError(
+            'CONFIRMATION_REQUIRED',
+            `Sync will replace data in ${target.name}. Re-run with --confirm "${target.name}" to authorize this.`,
+          );
+        }
+        if (target.environment === 'production' && normalizedMode !== 'append' && req.confirm !== target.name) {
+          throw new UdmtError(
+            'CONFIRMATION_REQUIRED',
+            `Connection "${target.name}" is marked production. Re-run with --confirm "${target.name}".`,
+          );
+        }
+      }
+
+      const warnings: string[] = [];
+      if (targetSchema) {
+        const existing = new Set(targetSchema.columns.map((column) => column.name));
+        const missing = fields.map((field) => field.target).filter((name) => !existing.has(name));
+        if (missing.length > 0) {
+          warnings.push(`Target columns missing (will be created by the provider if allowed): ${missing.join(', ')}`);
+        }
+      }
+      const unknown = fields.filter((field) => field.cast === 'unknown');
+      if (unknown.length > 0) {
+        warnings.push(`Fields without a type mapping are written as-is: ${unknown.map((field) => field.target).join(', ')}`);
+      }
+
+      const batchSize = req.batch_size ?? pipeline.options.batch_size ?? 1000;
+      const onError = req.on_error ?? pipeline.options.on_error ?? 'fail';
+      const limit = req.limit ?? pipeline.options.limit;
+      const readColumns = [...new Set([...fields.map((field) => field.source), ...(filter ? [filter.column] : [])])];
+      let retries = Math.min(Math.max(pipeline.options.retry?.max_attempts ?? 1, 1), 3);
+      if (normalizedMode === 'append') retries = 1; // appending twice is not idempotent
+      const backoffMs = Math.min(Math.max(pipeline.options.retry?.backoff_ms ?? 1000, 0), 30_000);
+
+      store.updateRunStatus(run.id, 'preflight', { stage: 'preflight' });
+      ctx.log(
+        'info',
+        `Preflight: ${source.name}.${pipeline.source_resource} -> ${target.name}.${pipeline.target_resource} ` +
+          `[${pipeline.load_mode}] ${fields.length} mapped field(s), filter=${filter ? `${filter.column} ${filter.operator}` : 'none'}`,
+      );
+
+      if (dryRun) {
+        const sampleLimit = Math.min(limit ?? 1000, 1000);
+        let sampled = 0;
+        let matched = 0;
+        let firstError: string | null = null;
+        const sampleErrors: string[] = [];
+        for await (const rows of sourceProvider.readRows!(
+          sourceValidated.config,
+          sourceSecret,
+          { resource: pipeline.source_resource, batchSize, columns: readColumns, limit: sampleLimit },
+          ctx,
+        )) {
+          for (const row of rows) {
+            ctx.throwIfCancelled();
+            if (sampled >= sampleLimit) break;
+            sampled += 1;
+            try {
+              if (!evaluateSyncFilter(row, filter)) continue;
+              matched += 1;
+              transformSyncRow(row, fields);
+            } catch (error) {
+              const code = error instanceof SyncRowError ? error.code : 'TRANSFORM_FAILED';
+              const message = sanitizeErrorMessage((error as Error).message ?? String(error));
+              if (!firstError) firstError = `${code}: ${message}`;
+              sampleErrors.push(message);
+              recordRowError(sampled, error);
+            }
+          }
+          if (sampled >= sampleLimit) break;
+        }
+        const status: OperationStatus = sampleErrors.length > 0 ? 'completed_with_warnings' : 'completed';
+        store.updateRunStatus(run.id, 'finalizing', { stage: 'dry_run' });
+        store.updateRunStatus(run.id, status, {
+          stage: 'completed',
+          finished_at: nowIso(),
+          progress: { percent: 100, stage: 'completed', rows_read: sampled },
+          result: {
+            dry_run: true,
+            pipeline_id: pipeline.id,
+            rows_sampled: sampled,
+            rows_matched: matched,
+            mapping: fields.map((field) => ({ source: field.source, target: field.target, type: field.cast })),
+            target_columns: targetSchema?.columns.map((column) => column.name) ?? null,
+            warnings: [...warnings, ...(firstError ? [`First row error: ${firstError}`] : [])],
+            errors: sampleErrors.length,
+            error_samples: sampleErrors.slice(0, 20),
+          },
+        });
+        ctx.log('info', `Dry run finished: ${sampled} rows sampled, ${matched} matched, ${sampleErrors.length} row errors.`);
+        return store.requireRun(run.id);
+      }
+
+      store.updateRunStatus(run.id, 'running', { stage: 'running' });
+
+      let succeeded = false;
+      for (let attempt = 1; attempt <= retries; attempt += 1) {
+        stats.attempts = attempt;
+        if (attempt > 1) {
+          store.clearSyncErrors(run.id);
+          stats.errors = 0;
+          stats.errors_persisted = 0;
+          stats.rows_read = 0;
+          stats.rows_filtered = 0;
+          stats.rows_written = 0;
+          stats.rows_skipped = 0;
+          stats.transformed = 0;
+          ctx.log('warn', `Retrying sync (attempt ${attempt}/${retries}) after a transient failure.`);
+        }
+        try {
+          let batchIndex = 0;
+          let rowIndex = 0;
+          const writeResult = await targetProvider.writeRows!(
+            targetValidated.config,
+            targetSecret,
+            {
+              resource: pipeline.target_resource,
+              columns: targetColumns,
+              mode: normalizedMode as 'append' | 'upsert' | 'truncate_and_load',
+              keyColumns: pipeline.key_columns,
+              createResource: pipeline.options.create_resource ?? true,
+            },
+            async function* (this: OperationEngine): AsyncGenerator<RowBatch> {
+              let out: RowBatch = [];
+              outer: for await (const rows of sourceProvider.readRows!(
+                sourceValidated.config,
+                sourceSecret,
+                { resource: pipeline.source_resource, batchSize, columns: readColumns, ...(limit ? { limit } : {}) },
+                ctx,
+              )) {
+                for (const sourceRow of rows) {
+                  ctx.throwIfCancelled();
+                  if (limit && rowIndex >= limit) break outer;
+                  rowIndex += 1;
+                  stats.rows_read += 1;
+                  try {
+                    if (!evaluateSyncFilter(sourceRow, filter)) {
+                      stats.rows_filtered += 1;
+                      continue;
+                    }
+                    const transformed = transformSyncRow(sourceRow, fields);
+                    stats.transformed += transformed.transformed;
+                    out.push(transformed.row);
+                  } catch (error) {
+                    if (onError === 'fail') {
+                      const code = error instanceof SyncRowError ? error.code : 'TRANSFORM_FAILED';
+                      throw new UdmtError(
+                        'SYNC_ROW_ERROR',
+                        `Sync stopped at source row ${rowIndex} (${code}): ${sanitizeErrorMessage((error as Error).message)}`,
+                        { details: { code, row_index: rowIndex, pipeline_id: pipeline.id } },
+                      );
+                    }
+                    stats.rows_skipped += 1;
+                    recordRowError(rowIndex, error);
+                    continue;
+                  }
+                  if (out.length >= batchSize) {
+                    batchIndex += 1;
+                    ctx.progress({
+                      percent: limit
+                        ? Math.min(96, Math.round((rowIndex / limit) * 96))
+                        : Math.min(90, 20 + Math.log10(Math.max(rowIndex, 1)) * 15),
+                      metrics: { rows_read: stats.rows_read, rows_written: stats.rows_written },
+                    });
+                    yield out;
+                    out = [];
+                  }
+                }
+              }
+              if (out.length > 0) {
+                batchIndex += 1;
+                yield out;
+              }
+              ctx.log('info', `Source stream finished after ${stats.rows_read} row(s), ${batchIndex} batch(es).`);
+            }.call(this),
+            ctx,
+          );
+          stats.rows_written = writeResult.rows_written;
+          warnings.push(...writeResult.warnings);
+          succeeded = true;
+          break;
+        } catch (error) {
+          const retryable =
+            attempt < retries &&
+            !controller.signal.aborted &&
+            isTransientSyncError(error) &&
+            normalizedMode !== 'append';
+          if (!retryable) throw error;
+          ctx.progress({ stage: 'retry_waiting', message: `Transient failure; retrying in ${backoffMs}ms` });
+          await sleep(backoffMs);
+        }
+      }
+      if (!succeeded) {
+        throw new UdmtError('OPERATION_FAILED', 'Sync did not complete after retries.');
+      }
+
+      store.updateRunStatus(run.id, 'finalizing', { stage: 'finalizing' });
+      const finalWarnings = [...warnings];
+      if (stats.errors > stats.errors_persisted) {
+        finalWarnings.push(`${stats.errors - stats.errors_persisted} additional row errors were not persisted (cap ${MAX_PERSISTED_ERRORS}).`);
+      }
+      if (stats.rows_skipped > 0) {
+        finalWarnings.push(`${stats.rows_skipped} row(s) were skipped and reported in the sync error list.`);
+      }
+      const finalStatus: OperationStatus = finalWarnings.length > 0 || stats.errors > 0 ? 'completed_with_warnings' : 'completed';
+      const finishedAt = nowIso();
+      store.updateRunStatus(run.id, finalStatus, {
+        stage: 'completed',
+        finished_at: finishedAt,
+        progress: {
+          percent: 100,
+          stage: 'completed',
+          rows_read: stats.rows_read,
+          rows_written: stats.rows_written,
+        },
+        result: {
+          pipeline_id: pipeline.id,
+          pipeline_name: pipeline.name,
+          rows_read: stats.rows_read,
+          rows_filtered: stats.rows_filtered,
+          rows_written: stats.rows_written,
+          rows_skipped: stats.rows_skipped,
+          values_transformed: stats.transformed,
+          errors: stats.errors,
+          errors_persisted: stats.errors_persisted,
+          mode: pipeline.load_mode,
+          attempts: stats.attempts,
+          source: `${source.name}.${pipeline.source_resource}`,
+          target: `${target.name}.${pipeline.target_resource}`,
+          warnings: finalWarnings,
+        },
+      });
+      const previous = store.getSyncState(pipeline.id);
+      store.upsertSyncState({
+        pipeline_id: pipeline.id,
+        checkpoint: {
+          checkpoint_version: 1,
+          kind: 'full',
+          completed_at: finishedAt,
+          rows_read: stats.rows_read,
+          rows_written: stats.rows_written,
+          rows_filtered: stats.rows_filtered,
+        },
+        last_run_id: run.id,
+        last_run_at: finishedAt,
+        last_status: finalStatus,
+        rows_synced: Number(previous?.rows_synced ?? 0) + stats.rows_written,
+      });
+      store.audit('sync.completed', {
+        pipeline_id: pipeline.id,
+        rows: stats.rows_written,
+        errors: stats.errors,
+        mode: pipeline.load_mode,
+      }, run.id);
+      ctx.log('info', `Sync completed: ${stats.rows_written} rows written, ${stats.rows_skipped} skipped.`);
+      return store.requireRun(run.id);
+    } catch (error) {
+      try {
+        const previous = store.getSyncState(pipeline.id);
+        store.upsertSyncState({
+          pipeline_id: pipeline.id,
+          checkpoint: {
+            ...(previous?.checkpoint ?? {}),
+            partial: true,
+            failed_at: nowIso(),
+            rows_read: stats.rows_read,
+            rows_written: stats.rows_written,
+          },
+          last_run_id: run.id,
+          last_run_at: nowIso(),
+          last_status: 'failed',
+          rows_synced: Number(previous?.rows_synced ?? 0),
+        });
+      } catch {
+        /* state persistence must not mask the original failure */
+      }
+      return this.failRun(run, error);
+    }
+  }
+
   // ------------------------------------------------------------------ verify
   async verifyArtifact(artifactId: string): Promise<{ run: OperationRun; artifact: ArtifactRecord; valid: boolean }> {
     const { store } = this.deps;
@@ -842,6 +1284,33 @@ function matchesType(value: unknown, type: ColumnSchema['type']): boolean {
     default:
       return true;
   }
+}
+
+const TRANSIENT_ERROR_CODES = new Set([
+  'ECONNRESET',
+  'ECONNREFUSED',
+  'ECONNABORTED',
+  'ETIMEDOUT',
+  'EAI_AGAIN',
+  'EPIPE',
+  'ENOTFOUND',
+  'SQLITE_BUSY',
+  'SQLITE_LOCKED',
+  'EBUSY',
+]);
+
+/**
+ * Retry eligibility for sync runs. Row-level transform errors are never
+ * transient; network and lock contention usually are.
+ */
+function isTransientSyncError(error: unknown): boolean {
+  if (isUdmtError(error)) return error.retryable;
+  const code = (error as { code?: unknown } | null)?.code;
+  if (typeof code === 'string' && TRANSIENT_ERROR_CODES.has(code)) return true;
+  const message = error instanceof Error ? error.message : String(error);
+  return /timeout|timed out|temporary|transient|connection reset|socket hang up|database is locked|rate limit|too many requests|\b(429|502|503|504)\b/i.test(
+    message,
+  );
 }
 
 export function formatFormats(): ExportFormat[] {

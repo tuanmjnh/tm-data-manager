@@ -3,7 +3,7 @@
 Engine: SQLite via `node:sqlite`. WAL journal, `foreign_keys=ON`, `busy_timeout=5000`.
 Location: `<data-dir>/udmt.db` (`UDMT_DATA_DIR` overrides the data dir).
 
-## Tables (version 1–3)
+## Tables (version 1–4)
 
 | Table | Purpose |
 |---|---|
@@ -21,11 +21,20 @@ Location: `<data-dir>/udmt.db` (`UDMT_DATA_DIR` overrides the data dir).
 | `settings` | small key/value store |
 | `audit_events` | sanitized actions (connection changes, retention deletions…) |
 | `legacy_imports` | raw rows preserved from the pre-UDMT schema |
+| `sync_pipelines` | source/target connection + resource, mapping JSON, load mode, key columns, options, enabled |
+| `sync_states` | last run/status, cumulative rows and the JSON checkpoint per pipeline |
+| `sync_run_errors` | persisted per-row sync errors (batch, row index, code, sanitized message) |
 
-Indexes: run list/status, logs by run, artifacts by creation/expiry, schedules due.
+Indexes: run list/status, logs by run, artifacts by creation/expiry, schedules due, sync pipelines by
+source/target, sync errors by run.
 
 Migration v3 (`storage-backend-health`) adds `endpoint_hint`, `last_tested_at` and `last_test_status` to
 `storage_backends`; it is additive and idempotent for pre-existing catalogs.
+
+Migration v4 (`sync-engine`) creates `sync_pipelines`, `sync_states` and `sync_run_errors`. The tables
+are new and cascade (`ON DELETE CASCADE`) from connections/pipelines/runs; no existing table or row is
+rewritten. `sync_states.checkpoint_json` is versioned (`checkpoint_version: 1`) so later incremental
+watermark fields can be added without a destructive migration.
 
 ## Migration policy
 

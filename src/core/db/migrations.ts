@@ -325,6 +325,53 @@ const MIGRATIONS: Migration[] = [
       if (!columns.has('endpoint_hint')) db.exec('ALTER TABLE storage_backends ADD COLUMN endpoint_hint TEXT NULL');
     },
   },
+  {
+    version: 4,
+    name: 'sync-engine',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS sync_pipelines (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL UNIQUE,
+          source_connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+          target_connection_id TEXT NOT NULL REFERENCES connections(id) ON DELETE CASCADE,
+          source_resource TEXT NOT NULL,
+          target_resource TEXT NOT NULL,
+          mapping_json TEXT NOT NULL,
+          load_mode TEXT NOT NULL,
+          key_columns_json TEXT NULL,
+          options_json TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 1,
+          created_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_pipelines_source ON sync_pipelines(source_connection_id);
+        CREATE INDEX IF NOT EXISTS idx_sync_pipelines_target ON sync_pipelines(target_connection_id);
+
+        CREATE TABLE IF NOT EXISTS sync_states (
+          pipeline_id TEXT PRIMARY KEY REFERENCES sync_pipelines(id) ON DELETE CASCADE,
+          checkpoint_json TEXT NOT NULL,
+          last_run_id TEXT NULL,
+          last_run_at TEXT NULL,
+          last_status TEXT NULL,
+          rows_synced INTEGER NOT NULL DEFAULT 0,
+          updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS sync_run_errors (
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          run_id TEXT NOT NULL REFERENCES operation_runs(id) ON DELETE CASCADE,
+          pipeline_id TEXT NULL,
+          batch_index INTEGER NULL,
+          row_index INTEGER NULL,
+          code TEXT NOT NULL,
+          message TEXT NOT NULL,
+          created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_run_errors_run ON sync_run_errors(run_id, id);
+      `);
+    },
+  },
 ];
 
 export function runMigrations(db: Db): number {
