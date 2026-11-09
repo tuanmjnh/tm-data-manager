@@ -23,6 +23,7 @@ export type ErrorCode =
   | 'LOCKED'
   | 'PATH_UNSAFE'
   | 'IO_ERROR'
+  | 'STORAGE_ERROR'
   | 'FORMAT_UNSUPPORTED'
   | 'OPERATION_FAILED'
   | 'OPERATION_CANCELLED'

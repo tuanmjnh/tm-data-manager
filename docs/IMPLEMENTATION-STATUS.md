@@ -148,6 +148,72 @@ STATUS: completed (notifications deferred)
 ```
 
 ```
+PHASE: 4 — Artifact storage backends (local + S3-compatible)
+STATUS: completed (tested against a real local HTTP endpoint; no live cloud account available)
+
+1. Implemented
+- Storage abstraction (`StorageBackend`): staging dir, put/get, stat, checksum, list, delete,
+  locator, health test. The operation engine streams to local staging first, so providers and the
+  import/export format layer stay backend-agnostic.
+- Local backend: staging under `<data-dir>/tmp/staging/<run-id>`, managed artifacts under
+  `<data-dir>/artifacts/<run-id>`, external `output_dir` preserved as `output_mode: external`.
+- S3-compatible backend (AWS S3, Cloudflare R2, MinIO, Backblaze B2): SigV4 signing implemented with
+  `crypto` + `fetch` (no vendor SDK), PUT/GET/HEAD/DELETE/ListObjectsV2, path-style and virtual-host
+  addressing, prefix validation, XML key parsing, sanitized error hints, upload/download checksums.
+- Export: stage locally → upload data + `.manifest.json` sidecar → catalog locator
+  `s3://bucket/key` → verify checksum against the remote object.
+- Import: materialize the remote object into staging, run the normal streaming import, then clean up;
+  `artifact delete` deletes both objects through the backend. Attribution: database rows are still
+  only written by `Store`.
+- Catalog CRUD + health probe: create/update/delete/set default/test; delete is refused for
+  `local-default`, the current default, or any backend that still owns artifacts; secrets are stored
+  in the vault and only a `localvault:` reference is persisted.
+- API: `GET/POST /api/storage/backends`, `GET/PATCH/DELETE /api/storage/backends/:id`,
+  `POST .../:id/test`, `POST .../:id/default` (legacy `GET /api/storage` kept).
+- CLI: `udmt storage list|inspect|add|test|default|remove`; `udmt artifact delete` now goes through the
+  backend.
+- GUI: Storage page with list, create/edit, connection test diagnostics, default switch and guarded
+  delete; nav entry + en/vi locales.
+- Migration v3 adds `endpoint_hint`, `last_tested_at`, `last_test_status`.
+
+2. Files changed
+- src/core/storage/{contract,local,s3,index}.ts (new), src/core/types.ts, src/core/errors.ts,
+  src/core/db/{migrations,store}.ts, src/core/service.ts, src/core/operation/engine.ts,
+  src/api/server.ts, src/cli/bin.ts, app/{pages/storage.vue,layouts/default.vue,types.ts,i18n/locales/*},
+  tests/unit/storage-signing.test.ts, tests/integration/storage-s3.test.ts, docs/{decisions, database}.
+
+3. Database migrations
+- v3 `storage-backend-health` (additive columns on `storage_backends`).
+
+4. Tests executed
+- `pnpm run typecheck` clean; `pnpm test` 51/51 passing; `pnpm run check:i18n` clean;
+  `pnpm --filter udmt-gui run build` succeeds.
+- Unit: RFC3986 canonical encoding, S3 locator, config/prefix validation, credentials required.
+- Integration (real HTTP server acting as S3): PUT/HEAD/GET/DELETE/ListObjectsV2 with a verified SigV4
+  `Authorization` header and SHA-256 payload header; backend CRUD + health probe stored in the catalog;
+  export → S3 → catalog locator → `artifact verify` → import round trip (25 rows) → artifact delete
+  removes both remote objects; delete protection for a backend that owns artifacts.
+- Existing round-trip suite still passes (local backend unchanged in behaviour).
+
+5. Manual verification
+- Exercised the storage page against the local API: create S3 backend, list, test (diagnostics),
+  set default, edit, delete; GUI build served from the generated output. No live AWS/R2/MinIO/B2
+  account was available in this environment, so real cloud credentials and CORS/bucket policies were
+  **not** verified; the fake endpoint implements the S3 wire format used by the backend.
+
+6. Known limitations / risks
+- No multipart upload: single-PUT objects are limited to the provider's maximum (5 GiB on AWS S3).
+- No server-side encryption headers, object lock, lifecycle or bucket auto-creation; configure these in
+  the provider console.
+- Virtual-host addressing is implemented but only path-style was exercised here.
+- Remote import always downloads the whole object to staging before importing (no ranged import).
+- No live cloud test; list pagination is implemented but only single-page responses were exercised.
+
+7. Next recommended phase
+- Phase 5 — Data Sync.
+```
+
+```
 PHASE: GUI (roadmap section 14, delivered with Phase 1–3)
 STATUS: completed for the implemented features
 

@@ -50,3 +50,22 @@ Quy tắc an toàn khi prune:
 
 Manifest gồm: cột và kiểu, số dòng, checksum, provider, tham số run và cảnh báo. Nhờ manifest mà file
 có thể được import ở nơi khác ngay cả khi catalog không còn.
+
+## Kho lưu trữ từ xa (S3, R2, MinIO, B2)
+
+Artifact có thể nằm trong kho tương thích S3 thay vì thư mục dữ liệu cục bộ. Thêm kho ở trang
+**Storage** (hoặc bằng CLI):
+
+```bash
+udmt storage add --name r2-backups --type s3 --endpoint https://<account>.r2.cloudflarestorage.com \
+  --bucket udmt-artifacts --prefix udmt --access-key-id <key> --secret-access-key-stdin
+udmt storage test r2-backups
+udmt storage default r2-backups
+```
+
+- Thông tin xác thực chỉ ghi một chiều: lưu trong vault mã hoá, không bao giờ vào catalog, nhật ký hay
+  file export.
+- Export vẫn ghi file tạm cục bộ trước, sau đó tải dữ liệu và manifest lên. Catalog ghi địa chỉ
+  `s3://bucket/key`.
+- Import tải object về thư mục tạm trước khi chạy luồng import streaming, rồi xoá file tạm.
+- Không thể xoá kho khi kho còn artifact hoặc đang là kho mặc định.

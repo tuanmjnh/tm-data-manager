@@ -238,8 +238,10 @@ export class Store {
 
   createStorageBackend(input: {
     name: string;
-    backend_type: 'local';
+    backend_type: StorageBackendRecord['backend_type'];
     config: Record<string, unknown>;
+    credential_ref?: string | null;
+    endpoint_hint?: string | null;
     is_default?: boolean;
   }): StorageBackendRecord {
     const id = newId();
@@ -250,18 +252,92 @@ export class Store {
     this.db.transaction(() => {
       if (input.is_default) this.db.run('UPDATE storage_backends SET is_default = 0');
       this.db.run(
-        `INSERT INTO storage_backends (id, name, backend_type, config_json, credential_ref, is_default, created_at, updated_at)
-         VALUES (?, ?, ?, ?, NULL, ?, ?, ?)`,
+        `INSERT INTO storage_backends
+         (id, name, backend_type, config_json, credential_ref, is_default, endpoint_hint, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
         id,
         input.name,
         input.backend_type,
         JSON.stringify(input.config),
+        input.credential_ref ?? null,
         input.is_default ? 1 : 0,
+        input.endpoint_hint ?? null,
         now,
         now,
       );
     });
     return this.requireStorageBackend(id);
+  }
+
+  updateStorageBackend(
+    idOrName: string,
+    patch: {
+      name?: string;
+      config?: Record<string, unknown>;
+      credential_ref?: string | null;
+      endpoint_hint?: string | null;
+      is_default?: boolean;
+    },
+  ): StorageBackendRecord {
+    const existing = this.requireStorageBackend(idOrName);
+    if (patch.name && patch.name !== existing.name && this.getStorageBackend(patch.name)) {
+      throw new UdmtError('ALREADY_EXISTS', `A storage backend named "${patch.name}" already exists.`);
+    }
+    this.db.transaction(() => {
+      if (patch.is_default) this.db.run('UPDATE storage_backends SET is_default = 0');
+      this.db.run(
+        `UPDATE storage_backends
+         SET name = ?, config_json = ?, credential_ref = ?, endpoint_hint = ?, is_default = ?, updated_at = ?
+         WHERE id = ?`,
+        patch.name ?? existing.name,
+        JSON.stringify(patch.config ?? existing.config),
+        patch.credential_ref === undefined ? existing.credential_ref : patch.credential_ref,
+        patch.endpoint_hint === undefined ? existing.endpoint_hint : patch.endpoint_hint,
+        (patch.is_default ?? existing.is_default) ? 1 : 0,
+        nowIso(),
+        existing.id,
+      );
+    });
+    return this.requireStorageBackend(existing.id);
+  }
+
+  deleteStorageBackend(idOrName: string): StorageBackendRecord {
+    const existing = this.requireStorageBackend(idOrName);
+    if (existing.id === 'local-default') {
+      throw new UdmtError('PRECONDITION_FAILED', 'The built-in local storage backend cannot be removed.');
+    }
+    if (existing.is_default) {
+      throw new UdmtError('CONFLICT', 'Choose another default backend before removing this one.');
+    }
+    const artifacts = this.db.get<{ count: number }>(
+      'SELECT COUNT(*) AS count FROM artifacts WHERE storage_backend_id = ?',
+      existing.id,
+    );
+    if (Number(artifacts?.count ?? 0) > 0) {
+      throw new UdmtError('CONFLICT', 'Storage backend still has artifacts. Delete or prune them first.');
+    }
+    this.db.run('DELETE FROM storage_backends WHERE id = ?', existing.id);
+    return existing;
+  }
+
+  setDefaultStorageBackend(idOrName: string): StorageBackendRecord {
+    const existing = this.requireStorageBackend(idOrName);
+    this.db.transaction(() => {
+      this.db.run('UPDATE storage_backends SET is_default = 0');
+      this.db.run('UPDATE storage_backends SET is_default = 1, updated_at = ? WHERE id = ?', nowIso(), existing.id);
+    });
+    return this.requireStorageBackend(existing.id);
+  }
+
+  recordStorageTest(id: string, status: 'success' | 'failed', endpointHint: string | null): void {
+    this.db.run(
+      'UPDATE storage_backends SET last_tested_at = ?, last_test_status = ?, endpoint_hint = COALESCE(?, endpoint_hint), updated_at = ? WHERE id = ?',
+      nowIso(),
+      status,
+      endpointHint,
+      nowIso(),
+      id,
+    );
   }
 
   // ---------------------------------------------------------------- runs
@@ -867,6 +943,9 @@ function mapStorage(row: Record<string, unknown>): StorageBackendRecord {
     config: json<Record<string, unknown>>(row.config_json as string, {}),
     credential_ref: (row.credential_ref as string | null) ?? null,
     is_default: Boolean(row.is_default),
+    endpoint_hint: (row.endpoint_hint as string | null) ?? null,
+    last_tested_at: (row.last_tested_at as string | null) ?? null,
+    last_test_status: (row.last_test_status as 'success' | 'failed' | null) ?? null,
     created_at: String(row.created_at),
     updated_at: String(row.updated_at),
   };

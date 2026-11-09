@@ -1,22 +1,27 @@
 import { createReadStream, existsSync, statSync } from 'node:fs';
-import { mkdir, readdir, rm, stat, rename } from 'node:fs/promises';
+import { copyFile, mkdir, readdir, rm, stat, rename } from 'node:fs/promises';
 import { dirname, join, relative, resolve } from 'node:path';
 import { assertSafePath } from '../paths.js';
 import { UdmtError } from '../errors.js';
 import { sha256File } from '../utils.js';
 import type { AppPaths } from '../paths.js';
+import type { StorageBackend, StorageObjectInfo, StorageTestResult } from './contract.js';
 
 /**
  * Local filesystem artifact backend (roadmap 9.1).
  * Every path is validated against the backend root before use.
  */
-export class LocalStorageBackend {
+export class LocalStorageBackend implements StorageBackend {
   readonly id: string;
+  readonly backend_type = 'local' as const;
+  readonly isRemote = false;
+  readonly endpoint_hint: string;
   readonly root: string;
 
   constructor(readonly paths: AppPaths, readonly backendId = 'local-default', root?: string) {
     this.id = backendId;
     this.root = resolve(root ?? paths.artifactsDir);
+    this.endpoint_hint = this.root;
     if (!existsSync(this.root)) mkdir(this.root, { recursive: true, mode: 0o700 }).catch(() => undefined);
   }
 
@@ -29,7 +34,7 @@ export class LocalStorageBackend {
     return absolute;
   }
 
-  async prepareRunDir(runId: string): Promise<string> {
+  async prepareStagingDir(runId: string): Promise<string> {
     const dir = join(this.root, runId);
     assertSafePath(dir, [this.root]);
     await mkdir(dir, { recursive: true, mode: 0o700 });
@@ -38,13 +43,31 @@ export class LocalStorageBackend {
 
   objectKeyFor(absolutePath: string): string {
     const key = relative(this.root, absolutePath);
-    if (key.startsWith('..') || key.includes(':') && process.platform === 'win32' && key.startsWith('..')) {
+    if (key.startsWith('..') || (key.includes(':') && process.platform === 'win32' && key.startsWith('..'))) {
       throw new UdmtError('PATH_UNSAFE', `Artifact is outside the storage root: ${absolutePath}`);
     }
     return key.split('\\').join('/');
   }
 
-  async statObject(objectKey: string): Promise<{ size: number; mtime: string }> {
+  describeObject(objectKey: string): string {
+    return this.resolveKey(objectKey);
+  }
+
+  async putObject(localPath: string, objectKey: string): Promise<void> {
+    const target = this.resolveKey(objectKey);
+    if (resolve(localPath) === target) return;
+    await mkdir(dirname(target), { recursive: true, mode: 0o700 });
+    await copyFile(localPath, target);
+  }
+
+  async getObject(objectKey: string, localPath: string): Promise<void> {
+    const source = this.resolveKey(objectKey);
+    if (resolve(source) === resolve(localPath)) return;
+    await mkdir(dirname(localPath), { recursive: true, mode: 0o700 });
+    await copyFile(source, localPath);
+  }
+
+  async statObject(objectKey: string): Promise<StorageObjectInfo> {
     const absolute = this.resolveKey(objectKey);
     const info = await stat(absolute);
     return { size: info.size, mtime: info.mtime.toISOString() };
@@ -60,7 +83,12 @@ export class LocalStorageBackend {
     const entries = await readdir(dir, { recursive: true, withFileTypes: true });
     return entries
       .filter((entry) => entry.isFile())
-      .map((entry) => relative(this.root, join(entry.parentPath ?? (entry as unknown as { path: string }).path, entry.name)).split('\\').join('/'));
+      .map((entry) =>
+        relative(
+          this.root,
+          join(entry.parentPath ?? (entry as unknown as { path: string }).path, entry.name),
+        ).split('\\').join('/'),
+      );
   }
 
   async deleteObject(objectKey: string): Promise<void> {
@@ -89,5 +117,28 @@ export class LocalStorageBackend {
 
   sizeOfFile(absolutePath: string): number {
     return statSync(absolutePath).size;
+  }
+
+  async test(): Promise<StorageTestResult> {
+    const started = Date.now();
+    try {
+      await mkdir(this.root, { recursive: true, mode: 0o700 });
+      const probe = join(this.root, `.udmt-write-test-${process.pid}-${Date.now()}`);
+      await mkdir(probe, { recursive: false, mode: 0o700 });
+      await rm(probe, { recursive: true, force: true });
+      return {
+        success: true,
+        latency_ms: Date.now() - started,
+        diagnostics: [`root: ${this.root}`, 'read/write probe: ok'],
+        endpoint_hint: this.root,
+      };
+    } catch (error) {
+      return {
+        success: false,
+        latency_ms: Date.now() - started,
+        diagnostics: [(error as Error).message],
+        endpoint_hint: this.root,
+      };
+    }
   }
 }

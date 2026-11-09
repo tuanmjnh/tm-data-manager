@@ -691,11 +691,7 @@ artifact
   .action(async (artifactId: string) => {
     await main(async () => {
       await withApp(async (app) => {
-        const found = app.getArtifact(artifactId);
-        app.deleteArtifact(artifactId);
-        const { rm } = await import('node:fs/promises');
-        await rm(found.absolute_path, { force: true });
-        await rm(`${found.absolute_path}.manifest.json`, { force: true });
+        await app.deleteArtifact(artifactId);
         process.stdout.write(`Deleted artifact ${artifactId}.\n`);
       });
     });
@@ -723,6 +719,149 @@ artifact
           process.stdout.write(`  ${item.id} ${item.manifest.resource ?? ''} ${formatBytes(item.size_bytes)}\n`);
         }
         for (const reason of result.skipped_reasons) process.stdout.write(`  skipped: ${reason}\n`);
+      });
+    });
+  });
+
+// ------------------------------------------------------------------ storage
+const storage = program.command('storage').description('Manage artifact storage backends');
+
+storage
+  .command('list')
+  .description('List storage backends')
+  .action(async () => {
+    await withApp((app) => {
+      const rows = app.listStorageBackends();
+      if (globalOptions().json) return printJson(rows);
+      printTable(
+        rows.map((row) => ({
+          id: row.id,
+          name: row.name,
+          type: row.backend_type,
+          default: row.is_default,
+          endpoint: row.endpoint_hint ?? '—',
+          last_test: row.last_test_status ? `${row.last_test_status} @ ${row.last_tested_at}` : 'never',
+        })),
+        ['id', 'name', 'type', 'default', 'endpoint', 'last_test'],
+      );
+    });
+  });
+
+storage
+  .command('inspect')
+  .argument('<backend>')
+  .description('Show a storage backend (secrets are never printed)')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const row = app.getStorageBackend(idOrName);
+      if (globalOptions().json) return printJson(row);
+      process.stdout.write(`${row.name} (${row.id}) — ${row.backend_type}\n`);
+      process.stdout.write(`default:  ${row.is_default ? 'yes' : 'no'}\n`);
+      process.stdout.write(`endpoint: ${row.endpoint_hint ?? '—'}\n`);
+      process.stdout.write(`credential: ${row.credential_ref ? 'stored encrypted' : 'none'}\n`);
+      process.stdout.write(`last test:  ${row.last_test_status ?? 'never'} ${row.last_tested_at ?? ''}\n`);
+      process.stdout.write(`config:   ${JSON.stringify(row.config, null, 2)}\n`);
+    });
+  });
+
+storage
+  .command('add')
+  .description('Add a local or S3-compatible storage backend')
+  .requiredOption('--name <name>')
+  .addOption(new Option('--type <type>', 'backend type').choices(['local', 's3']).default('local'))
+  .option('--root <dir>', 'local backend root (managed under the artifacts directory by default)')
+  .option('--endpoint <url>', 'S3 endpoint URL')
+  .option('--region <region>', 'S3 region', 'auto')
+  .option('--bucket <bucket>')
+  .option('--prefix <prefix>')
+  .option('--access-key-id <id>')
+  .option('--secret-access-key <key>', 'prefer --secret-access-key-stdin')
+  .option('--secret-access-key-stdin', 'read the S3 secret access key from stdin')
+  .option('--session-token <token>')
+  .option('--virtual-host', 'use virtual-hosted bucket addressing instead of path-style')
+  .option('--default', 'make this the default artifact backend')
+  .action(async (options: Record<string, unknown>) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const type = String(options.type) as 'local' | 's3';
+        let secret: Record<string, unknown> = {};
+        if (type === 's3') {
+          if (!options.endpoint || !options.bucket) {
+            throw new UdmtError('INVALID_INPUT', 'S3 storage needs --endpoint and --bucket.');
+          }
+          const secretKey = options.secretAccessKeyStdin
+            ? (await readStdin()) || undefined
+            : (options.secretAccessKey as string | undefined);
+          if (!options.accessKeyId || !secretKey) {
+            throw new UdmtError('INVALID_INPUT', 'S3 storage needs --access-key-id and a secret access key.');
+          }
+          secret = {
+            access_key_id: String(options.accessKeyId),
+            secret_access_key: String(secretKey),
+            ...(options.sessionToken ? { session_token: String(options.sessionToken) } : {}),
+          };
+        }
+        const created = app.createStorageBackend({
+          name: String(options.name),
+          backend_type: type,
+          config:
+            type === 's3'
+              ? {
+                  endpoint: String(options.endpoint),
+                  region: String(options.region ?? 'auto'),
+                  bucket: String(options.bucket),
+                  ...(options.prefix ? { prefix: String(options.prefix) } : {}),
+                  force_path_style: !options.virtualHost,
+                }
+              : options.root
+                ? { root: String(options.root) }
+                : {},
+          secret,
+          is_default: Boolean(options.default),
+        });
+        if (globalOptions().json) return printJson(created);
+        process.stdout.write(`Created storage backend "${created.name}" (${created.backend_type}).\n`);
+        process.stdout.write(`Endpoint: ${created.endpoint_hint ?? '—'}\n`);
+      });
+    });
+  });
+
+storage
+  .command('test')
+  .argument('<backend>')
+  .description('Probe read/write access for a storage backend')
+  .action(async (idOrName: string) => {
+    await main(async () => {
+      await withApp(async (app) => {
+        const result = await app.testStorageBackend(idOrName);
+        if (globalOptions().json) return printJson(result);
+        process.stdout.write(`${result.success ? 'OK' : 'FAILED'} ${idOrName} (${result.latency_ms}ms)\n`);
+        for (const line of result.diagnostics) process.stdout.write(`  - ${line}\n`);
+        if (!result.success) throw new UdmtError('STORAGE_ERROR', result.diagnostics[0] ?? 'Storage test failed');
+      });
+    });
+  });
+
+storage
+  .command('default')
+  .argument('<backend>')
+  .description('Choose the default artifact backend')
+  .action(async (idOrName: string) => {
+    await withApp((app) => {
+      const updated = app.setDefaultStorageBackend(idOrName);
+      process.stdout.write(`Default storage backend is now "${updated.name}".\n`);
+    });
+  });
+
+storage
+  .command('remove')
+  .argument('<backend>')
+  .description('Remove a storage backend (must be empty and not the default)')
+  .action(async (idOrName: string) => {
+    await main(async () => {
+      await withApp((app) => {
+        app.deleteStorageBackend(idOrName);
+        process.stdout.write(`Removed storage backend "${idOrName}".\n`);
       });
     });
   });

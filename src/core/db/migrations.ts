@@ -315,6 +315,16 @@ const MIGRATIONS: Migration[] = [
       db.exec('CREATE INDEX IF NOT EXISTS idx_artifacts_expiry ON artifacts(expires_at)');
     },
   },
+  {
+    version: 3,
+    name: 'storage-backend-health',
+    up: (db) => {
+      const columns = new Set(tableColumns(db, 'storage_backends'));
+      if (!columns.has('last_tested_at')) db.exec('ALTER TABLE storage_backends ADD COLUMN last_tested_at TEXT NULL');
+      if (!columns.has('last_test_status')) db.exec('ALTER TABLE storage_backends ADD COLUMN last_test_status TEXT NULL');
+      if (!columns.has('endpoint_hint')) db.exec('ALTER TABLE storage_backends ADD COLUMN endpoint_hint TEXT NULL');
+    },
+  },
 ];
 
 export function runMigrations(db: Db): number {

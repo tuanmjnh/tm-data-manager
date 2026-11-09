@@ -10,6 +10,7 @@ import type { ProviderRegistry } from '../providers/registry.js';
 import type { OperationContext, DataProvider } from '../providers/contract.js';
 import { hasCapability, inferType } from '../providers/contract.js';
 import type { LocalStorageBackend } from '../storage/local.js';
+import type { StorageBackend } from '../storage/contract.js';
 import { createFormatWriter, defaultExtension, detectFormat, readRowsFromFile, type FormatWriter } from '../formats/index.js';
 import { assertSafePath, assertSafeSegment } from '../paths.js';
 import { APP_VERSION, fileSize, newId, nowIso, sanitizeName, sha256File, timestampForFilename, truncate } from '../utils.js';
@@ -59,7 +60,8 @@ export interface EngineDeps {
   registry: ProviderRegistry;
   secrets: SecretStore;
   paths: AppPaths;
-  storage: LocalStorageBackend;
+  managedStorage: LocalStorageBackend;
+  resolveStorage: (idOrName?: string | null) => StorageBackend;
 }
 
 export interface StartedOperation {
@@ -197,11 +199,12 @@ export class OperationEngine {
   }
 
   private async executeExport(run: OperationRun, req: z.infer<typeof ExportSchema>, controller: AbortController): Promise<OperationRun> {
-    const { store, registry, secrets, storage } = this.deps;
+    const { store, registry, secrets, resolveStorage, managedStorage } = this.deps;
     const ctx = this.makeContext(run, controller);
     let writer: FormatWriter | undefined;
     let dataPath: string | undefined;
     let sidecarPath: string | undefined;
+    let uploadedObject: { backend: StorageBackend; key: string } | undefined;
     const warnings: string[] = [];
 
     try {
@@ -235,19 +238,27 @@ export class OperationEngine {
       }
       const columns: ColumnSchema[] = selected.length > 0 ? selected : schema.columns;
 
-      const backend = req.storage_backend_id
+      const backendRecord = req.storage_backend_id
         ? store.requireStorageBackend(req.storage_backend_id)
         : store.requireStorageBackend(connection.default_storage_id ?? undefined);
-      const managedRoot = backend.id === 'local-default' ? storage.root : resolve(storage.paths.artifactsDir, backend.id);
+      const backend = resolveStorage(backendRecord.id);
       const externalDir = req.output_dir ? resolve(req.output_dir) : undefined;
-      if (externalDir && !externalDir.startsWith(storage.root)) {
-        if (!/^[A-Za-z]:[\\/]|^\//.test(req.output_dir!) && !req.output_dir!.startsWith('~')) {
+      if (externalDir) {
+        if (backend.isRemote) {
+          throw new UdmtError(
+            'INVALID_INPUT',
+            'output_dir cannot be combined with a remote storage backend. Export to the backend and fetch the artifact instead.',
+          );
+        }
+        if (!(/^[A-Za-z]:[\\/]|^\//.test(req.output_dir!) || req.output_dir!.startsWith('~') || externalDir.startsWith(managedStorage.root))) {
           throw new UdmtError('PATH_UNSAFE', 'Relative output directories must resolve inside the managed artifacts root.');
         }
-        ctx.warn('Writing to an explicit external directory outside the managed artifacts root.');
+        if (!externalDir.startsWith(managedStorage.root)) {
+          ctx.warn('Writing to an explicit external directory outside the managed artifacts root.');
+        }
       }
 
-      const targetDir = externalDir ?? (backend.id === 'local-default' ? await storage.prepareRunDir(run.id) : join(managedRoot, run.id));
+      const targetDir = externalDir ?? (await backend.prepareStagingDir(run.id));
       await mkdir(targetDir, { recursive: true, mode: 0o700 });
       const safeResource = sanitizeName(req.resource.replace(/[./\\]/g, '_'));
       const fileName = `${sanitizeName(connection.name)}-${safeResource}-${timestampForFilename()}.${requestExtension(req.format, req.compression)}`;
@@ -320,21 +331,36 @@ export class OperationEngine {
       await writeFile(`${sidecarPath}.tmp`, JSON.stringify(manifest, null, 2), { mode: 0o600 });
       await rename(`${sidecarPath}.tmp`, sidecarPath);
 
-      const objectKey = externalDir ? dataPath : storage.objectKeyFor(dataPath);
+      const objectKey = externalDir ? dataPath : backend.objectKeyFor(dataPath, run.id);
+      let absolutePath = externalDir ? dataPath : backend.describeObject(objectKey);
+      let manifestPath = sidecarPath;
+      if (!externalDir && backend.isRemote) {
+        await backend.putObject(dataPath, objectKey, { sha256: checksum });
+        uploadedObject = { backend, key: objectKey };
+        const sidecarKey = `${objectKey}.manifest.json`;
+        await backend.putObject(sidecarPath, sidecarKey, { sha256: await sha256File(sidecarPath) });
+        // The remote object is now the durable copy; keep local staging lean.
+        await rm(dataPath, { force: true }).catch(() => undefined);
+        await rm(sidecarPath, { force: true }).catch(() => undefined);
+        dataPath = undefined;
+        sidecarPath = undefined;
+        absolutePath = backend.describeObject(objectKey);
+        manifestPath = backend.describeObject(sidecarKey);
+      }
       store.createArtifact({
         run_id: run.id,
         artifact_type: 'export',
         provider_id: connection.provider_id,
         storage_backend_id: backend.id,
         object_key: objectKey,
-        absolute_path: dataPath,
+        absolute_path: absolutePath,
         manifest,
         size_bytes: size,
         checksum_value: checksum,
       });
 
       store.updateRunStatus(run.id, 'verifying', { stage: 'verifying' });
-      const recheck = await sha256File(dataPath);
+      const recheck = backend.isRemote && !externalDir ? await backend.checksum(objectKey) : await sha256File(absolutePath);
       if (recheck !== checksum) {
         store.updateArtifactVerification(artifactId, 'failed');
         throw new UdmtError('OPERATION_FAILED', 'Checksum mismatch right after writing the artifact.');
@@ -348,8 +374,9 @@ export class OperationEngine {
         progress: { percent: 100, stage: 'completed', rows_read: written.row_count, bytes_written: size },
         result: {
           artifact_id: artifactId,
-          path: dataPath,
-          manifest_path: sidecarPath,
+          path: absolutePath,
+          manifest_path: manifestPath,
+          storage_backend_id: backend.id,
           rows: written.row_count,
           bytes: size,
           checksum_sha256: checksum,
@@ -362,7 +389,11 @@ export class OperationEngine {
       ctx.log('info', `Export completed: ${written.row_count} rows, ${size} bytes, sha256=${checksum.slice(0, 12)}…`);
       return store.requireRun(run.id);
     } catch (error) {
-      return this.failRun(run, error, { writer, cleanupPaths: [dataPath, sidecarPath] });
+      return this.failRun(run, error, {
+        writer,
+        cleanupPaths: [dataPath, sidecarPath],
+        cleanupObjects: uploadedObject ? [uploadedObject] : [],
+      });
     }
   }
 
@@ -412,6 +443,7 @@ export class OperationEngine {
     const { store, registry, secrets } = this.deps;
     const ctx = this.makeContext(run, controller);
     const warnings: string[] = [];
+    const cleanupPaths: string[] = [];
 
     try {
       store.updateRunStatus(run.id, 'preparing', { stage: 'preparing', started_at: nowIso() });
@@ -425,6 +457,7 @@ export class OperationEngine {
       }
 
       const source = await this.resolveImportSource(req, provider, connection.provider_id);
+      if (source.materialized) cleanupPaths.push(source.materialized);
       store.updateRunStatus(run.id, 'preflight', { stage: 'preflight' });
       ctx.log('info', `Preflight: ${source.path} (${source.format}) -> ${connection.name} ${req.resource} [${req.mode}]`);
 
@@ -567,6 +600,10 @@ export class OperationEngine {
       return store.requireRun(run.id);
     } catch (error) {
       return this.failRun(run, error);
+    } finally {
+      for (const path of cleanupPaths) {
+        await rm(path, { force: true }).catch(() => undefined);
+      }
     }
   }
 
@@ -588,12 +625,14 @@ export class OperationEngine {
     const ctx = this.makeContext(run, controller);
     try {
       store.updateRunStatus(run.id, 'preparing', { stage: 'preparing', started_at: nowIso() });
-      if (!existsSync(artifact.absolute_path)) {
+      const remote = /^s3:\/\//.test(artifact.absolute_path);
+      if (!remote && !existsSync(artifact.absolute_path)) {
         throw new UdmtError('NOT_FOUND', `Artifact file is missing: ${artifact.absolute_path}`);
       }
       store.updateRunStatus(run.id, 'preflight', { stage: 'preflight' });
       store.updateRunStatus(run.id, 'running', { stage: 'hashing' });
-      const actual = await sha256File(artifact.absolute_path);
+      const backend = remote ? this.deps.resolveStorage(artifact.storage_backend_id) : null;
+      const actual = backend ? await backend.checksum(artifact.object_key) : await sha256File(artifact.absolute_path);
       const valid = actual === artifact.checksum_value;
       store.updateArtifactVerification(artifact.id, valid ? 'verified' : 'failed', valid ? actual : undefined);
       if (!valid) {
@@ -625,24 +664,36 @@ export class OperationEngine {
     format: ExportFormat;
     columns: ColumnSchema[];
     manifest: ArtifactManifest | null;
+    /** Local temp file created for a remote artifact, removed after the run. */
+    materialized?: string | null;
   }> {
     const { store } = this.deps;
     if (req.source.artifact_id) {
       const artifact = store.requireArtifact(req.source.artifact_id);
-      if (!existsSync(artifact.absolute_path)) {
-        throw new UdmtError('NOT_FOUND', `Artifact file is missing: ${artifact.absolute_path}`);
-      }
       if (artifact.manifest.provider_id !== providerId) {
         throw new UdmtError(
           'PRECONDITION_FAILED',
           `Artifact was produced by ${artifact.manifest.provider_id} but the target is ${providerId}. Use a file path to force a cross-provider import.`,
         );
       }
+      let path = artifact.absolute_path;
+      let materialized: string | null = null;
+      if (/^s3:\/\//.test(path)) {
+        const backend = this.deps.resolveStorage(artifact.storage_backend_id);
+        const dir = join(this.deps.paths.tempDir, 'staging', `artifact-${artifact.id}`);
+        await mkdir(dir, { recursive: true, mode: 0o700 });
+        path = join(dir, basename(artifact.object_key));
+        await backend.getObject(artifact.object_key, path);
+        materialized = path;
+      } else if (!existsSync(path)) {
+        throw new UdmtError('NOT_FOUND', `Artifact file is missing: ${path}`);
+      }
       return {
-        path: artifact.absolute_path,
+        path,
         format: req.format ?? artifact.manifest.format,
         columns: artifact.manifest.columns,
         manifest: artifact.manifest,
+        materialized,
       };
     }
 
@@ -706,7 +757,11 @@ export class OperationEngine {
   private async failRun(
     run: OperationRun,
     error: unknown,
-    options: { writer?: FormatWriter; cleanupPaths?: Array<string | undefined> } = {},
+    options: {
+      writer?: FormatWriter;
+      cleanupPaths?: Array<string | undefined>;
+      cleanupObjects?: Array<{ backend: StorageBackend; key: string }>;
+    } = {},
   ): Promise<OperationRun> {
     const { store } = this.deps;
     const udmt = toUdmtError(error, 'OPERATION_FAILED');
@@ -724,6 +779,10 @@ export class OperationEngine {
       await rm(path, { force: true }).catch(() => undefined);
       await rm(`${path}.manifest.json`, { force: true }).catch(() => undefined);
       await rm(`${path}.manifest.json.tmp`, { force: true }).catch(() => undefined);
+    }
+    for (const object of options.cleanupObjects ?? []) {
+      await object.backend.deleteObject(object.key).catch(() => undefined);
+      await object.backend.deleteObject(`${object.key}.manifest.json`).catch(() => undefined);
     }
 
     try {

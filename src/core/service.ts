@@ -8,6 +8,8 @@ import { ensureAppDirs, resolveAppPaths, type AppPaths } from './paths.js';
 import { ProviderRegistry } from './providers/registry.js';
 import { SecretStore } from './secrets.js';
 import { LocalStorageBackend } from './storage/local.js';
+import { createStorageBackend as buildStorageBackend, managedLocalBackend } from './storage/index.js';
+import type { StorageBackend } from './storage/contract.js';
 import { OperationEngine } from './operation/engine.js';
 import { describeSchedule, nextRunAt, validateSchedule, type ScheduleInput } from './scheduler.js';
 import { UdmtError, toUdmtError } from './errors.js';
@@ -32,9 +34,25 @@ import type {
   RowsPreview,
   ScheduleRecord,
   StorageBackendRecord,
+  StorageBackendType,
+  StorageTestResult,
   WorkerInstance,
 } from './types.js';
-import { ENVIRONMENTS, PREVIEW_ROW_LIMIT } from './types.js';
+import { ENVIRONMENTS, PREVIEW_ROW_LIMIT, STORAGE_BACKEND_TYPES } from './types.js';
+
+export interface CreateStorageBackendInput {
+  name: string;
+  backend_type: StorageBackendType;
+  config?: Record<string, unknown>;
+  secret?: Record<string, unknown>;
+  is_default?: boolean;
+}
+
+export interface UpdateStorageBackendInput {
+  name?: string;
+  config?: Record<string, unknown>;
+  secret?: Record<string, unknown>;
+}
 
 export interface CreateConnectionInput {
   name: string;
@@ -75,7 +93,8 @@ export class UdmtApp {
   readonly store: Store;
   readonly secrets: SecretStore;
   readonly registry: ProviderRegistry;
-  readonly storage: LocalStorageBackend;
+  /** Always-present local backend; used for staging and safe fallback. */
+  readonly managedStorage: LocalStorageBackend;
   readonly engine: OperationEngine;
 
   constructor(options: { dataDir?: string } = {}) {
@@ -86,13 +105,14 @@ export class UdmtApp {
       this.store = new Store(this.db);
       this.secrets = new SecretStore(this.db, this.paths);
       this.registry = new ProviderRegistry();
-      this.storage = new LocalStorageBackend(this.paths);
+      this.managedStorage = managedLocalBackend(this.paths);
       this.engine = new OperationEngine({
         store: this.store,
         registry: this.registry,
         secrets: this.secrets,
         paths: this.paths,
-        storage: this.storage,
+        managedStorage: this.managedStorage,
+        resolveStorage: (idOrName) => this.storageBackend(idOrName),
       });
     } catch (error) {
       // Never leak a locked metadata database when startup fails.
@@ -329,15 +349,37 @@ export class UdmtApp {
     return this.store.requireArtifact(id);
   }
 
-  deleteArtifact(id: string): void {
+  async deleteArtifact(id: string): Promise<void> {
     const artifact = this.store.requireArtifact(id);
     if (artifact.pinned) throw new UdmtError('CONFLICT', 'Artifact is pinned. Unpin it before deleting.');
     const verifying = this.store
       .listRuns({ limit: 100 })
       .some((run) => run.operation_type === 'verify' && run.source_label === id && !isTerminal(run.status));
     if (verifying) throw new UdmtError('CONFLICT', 'Artifact is being verified right now.');
+    await this.removeArtifactObject(artifact);
     this.store.deleteArtifactRecord(id);
     this.store.audit('artifact.deleted', { artifact_id: id, path: artifact.absolute_path });
+  }
+
+  /**
+   * Deletes the bytes behind an artifact without touching its record. External
+   * files are removed by absolute path; managed artifacts go through the storage
+   * backend so S3/R2 objects and named local roots behave the same.
+   */
+  private async removeArtifactObject(artifact: ArtifactRecord): Promise<void> {
+    if (artifact.manifest.output_mode === 'external' || /^[A-Za-z]:[\\/]|^\//.test(artifact.object_key)) {
+      await rm(artifact.absolute_path, { force: true }).catch(() => undefined);
+      await rm(`${artifact.absolute_path}.manifest.json`, { force: true }).catch(() => undefined);
+      return;
+    }
+    try {
+      const backend = this.storageBackend(artifact.storage_backend_id);
+      await backend.deleteObject(artifact.object_key);
+      await backend.deleteObject(`${artifact.object_key}.manifest.json`).catch(() => undefined);
+    } catch (error) {
+      // A missing backend should not strand the metadata row; surface the reason.
+      if ((error as UdmtError).code !== 'NOT_FOUND') throw error;
+    }
   }
 
   /**
@@ -380,11 +422,18 @@ export class UdmtApp {
           return;
         }
         try {
-          if (existsSync(artifact.absolute_path)) {
-            // Only delete inside the managed root, or the exact external file we created.
-            const managed = artifact.absolute_path.startsWith(this.storage.root);
-            if (!managed && artifact.manifest.output_mode !== 'external') {
-              skipped.push(`${artifact.id}: outside managed root`);
+          if (artifact.manifest.output_mode !== 'external') {
+            // Only delete inside a managed root. A named backend resolves its
+            // own root; remote artifacts never have a local file to inspect.
+            try {
+              const backend = this.storageBackend(artifact.storage_backend_id);
+              const local = !backend.isRemote && existsSync(artifact.absolute_path);
+              if (local && !artifact.absolute_path.startsWith((backend as LocalStorageBackend).root)) {
+                skipped.push(`${artifact.id}: outside managed root`);
+                return;
+              }
+            } catch {
+              skipped.push(`${artifact.id}: storage backend missing`);
               return;
             }
           }
@@ -398,13 +447,17 @@ export class UdmtApp {
 
     if (!options.dry_run) {
       for (const artifact of deleted) {
-        await rm(artifact.absolute_path, { force: true }).catch(() => undefined);
-        await rm(`${artifact.absolute_path}.manifest.json`, { force: true }).catch(() => undefined);
+        try {
+          await this.removeArtifactObject(artifact);
+        } catch (error) {
+          skipped.push(`${artifact.id}: ${(error as Error).message}`);
+        }
       }
-      // Remove empty run directories.
+      // Remove empty run directories owned by the managed local backend.
       for (const artifact of deleted) {
+        if (!artifact.absolute_path.startsWith(this.managedStorage.root)) continue;
         const dir = resolve(artifact.absolute_path, '..');
-        if (dir.startsWith(this.storage.root)) {
+        if (dir.startsWith(this.managedStorage.root)) {
           await rm(dir, { recursive: false }).catch(() => undefined);
         }
       }
@@ -422,14 +475,99 @@ export class UdmtApp {
     return this.store.listStorageBackends();
   }
 
-  createStorageBackend(name: string, root: string): StorageBackendRecord {
-    const absolute = resolve(this.paths.artifactsDir, sanitizeName(name));
-    void root;
-    return this.store.createStorageBackend({
+  getStorageBackend(idOrName: string): StorageBackendRecord {
+    return this.store.requireStorageBackend(idOrName);
+  }
+
+  /** Instantiates a backend from its catalog record and vault secret. */
+  storageBackend(idOrName?: string | null): StorageBackend {
+    const record = this.store.requireStorageBackend(idOrName ?? null);
+    const secret = record.credential_ref ? this.secrets.load(record.credential_ref) : {};
+    return buildStorageBackend(this.paths, record, secret);
+  }
+
+  createStorageBackend(input: CreateStorageBackendInput): StorageBackendRecord {
+    if (!input.name?.trim()) throw new UdmtError('INVALID_INPUT', 'Storage backend name is required.');
+    if (!STORAGE_BACKEND_TYPES.includes(input.backend_type)) {
+      throw new UdmtError('INVALID_INPUT', `Unknown storage backend type: ${input.backend_type}`);
+    }
+    const name = input.name.trim();
+    const config =
+      input.backend_type === 'local'
+        ? { ...(input.config ?? {}), root: resolve(String(input.config?.root ?? resolve(this.paths.artifactsDir, sanitizeName(name)))) }
+        : { ...(input.config ?? {}) };
+    const secret = input.secret ?? {};
+    // Validate before persisting so an invalid backend never lands in the catalog.
+    const candidate = buildStorageBackend(
+      this.paths,
+      {
+        id: 'pending',
+        name,
+        backend_type: input.backend_type,
+        config,
+        credential_ref: null,
+        is_default: false,
+        endpoint_hint: null,
+        last_tested_at: null,
+        last_test_status: null,
+        created_at: nowIso(),
+        updated_at: nowIso(),
+      },
+      secret,
+    );
+    const credentialRef = Object.keys(secret).length > 0 ? this.secrets.save(secret) : null;
+    const created = this.store.createStorageBackend({
       name,
-      backend_type: 'local',
-      config: { root: absolute },
+      backend_type: input.backend_type,
+      config,
+      credential_ref: credentialRef,
+      endpoint_hint: candidate.endpoint_hint,
+      is_default: input.is_default ?? false,
     });
+    this.store.audit('storage.created', { storage: created.name, type: created.backend_type });
+    return created;
+  }
+
+  updateStorageBackend(idOrName: string, patch: UpdateStorageBackendInput): StorageBackendRecord {
+    const existing = this.store.requireStorageBackend(idOrName);
+    if (existing.id === 'local-default' && patch.config) {
+      throw new UdmtError('PRECONDITION_FAILED', 'The built-in local backend location cannot be changed.');
+    }
+    const config = patch.config ?? existing.config;
+    const secret = patch.secret ? { ...this.secrets.load(existing.credential_ref), ...patch.secret } : this.secrets.load(existing.credential_ref);
+    const candidate = buildStorageBackend(this.paths, { ...existing, config }, secret);
+    const credentialRef = patch.secret || patch.config
+      ? this.secrets.replace(existing.credential_ref, secret)
+      : existing.credential_ref;
+    const updated = this.store.updateStorageBackend(existing.id, {
+      name: patch.name,
+      config,
+      credential_ref: credentialRef,
+      endpoint_hint: candidate.endpoint_hint,
+    });
+    this.store.audit('storage.updated', { storage: updated.name });
+    return updated;
+  }
+
+  deleteStorageBackend(idOrName: string): void {
+    const existing = this.store.requireStorageBackend(idOrName);
+    this.store.deleteStorageBackend(existing.id);
+    if (existing.credential_ref) this.secrets.delete(existing.credential_ref);
+    this.store.audit('storage.deleted', { storage: existing.name });
+  }
+
+  setDefaultStorageBackend(idOrName: string): StorageBackendRecord {
+    const updated = this.store.setDefaultStorageBackend(idOrName);
+    this.store.audit('storage.default', { storage: updated.name });
+    return updated;
+  }
+
+  async testStorageBackend(idOrName: string): Promise<StorageTestResult> {
+    const record = this.store.requireStorageBackend(idOrName);
+    const backend = this.storageBackend(record.id);
+    const result = await backend.test();
+    this.store.recordStorageTest(record.id, result.success ? 'success' : 'failed', result.endpoint_hint);
+    return { ...result, tested_at: nowIso() };
   }
 
   // ------------------------------------------------------------------ jobs & schedules

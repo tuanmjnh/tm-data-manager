@@ -309,15 +309,30 @@ export interface JobRecord {
   updated_at: string;
 }
 
+export type StorageBackendType = 'local' | 's3';
+export const STORAGE_BACKEND_TYPES: StorageBackendType[] = ['local', 's3'];
+
 export interface StorageBackendRecord {
   id: string;
   name: string;
-  backend_type: 'local';
+  backend_type: StorageBackendType;
   config: Record<string, unknown>;
   credential_ref: string | null;
   is_default: boolean;
+  /** Sanitized location summary (never contains credentials). */
+  endpoint_hint: string | null;
+  last_tested_at: string | null;
+  last_test_status: 'success' | 'failed' | null;
   created_at: string;
   updated_at: string;
+}
+
+export interface StorageTestResult {
+  success: boolean;
+  latency_ms: number;
+  diagnostics: string[];
+  endpoint_hint: string | null;
+  tested_at: string;
 }
 
 export interface WorkerInstance {

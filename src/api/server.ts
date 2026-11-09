@@ -248,7 +248,7 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
       return sendJson(res, 200, app.getArtifact(decodeURIComponent(artifactMatch[1]!)));
     }
     if (artifactMatch && method === 'DELETE') {
-      app.deleteArtifact(decodeURIComponent(artifactMatch[1]!));
+      await app.deleteArtifact(decodeURIComponent(artifactMatch[1]!));
       return sendJson(res, 200, { deleted: true });
     }
 
@@ -312,6 +312,37 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
 
     if (path === '/api/storage' && method === 'GET') {
       return sendJson(res, 200, { backends: app.listStorageBackends(), root: app.paths.artifactsDir });
+    }
+
+    if (path === '/api/storage/backends' && method === 'GET') {
+      return sendJson(res, 200, app.listStorageBackends());
+    }
+    if (path === '/api/storage/backends' && method === 'POST') {
+      const body = await readJson(req);
+      return sendJson(res, 201, app.createStorageBackend(body as never));
+    }
+
+    const storageMatch = /^\/api\/storage\/backends\/([^/]+)$/.exec(path);
+    if (storageMatch && method === 'GET') {
+      return sendJson(res, 200, app.getStorageBackend(decodeURIComponent(storageMatch[1]!)));
+    }
+    if (storageMatch && method === 'PATCH') {
+      const body = await readJson(req);
+      return sendJson(res, 200, app.updateStorageBackend(decodeURIComponent(storageMatch[1]!), body as never));
+    }
+    if (storageMatch && method === 'DELETE') {
+      app.deleteStorageBackend(decodeURIComponent(storageMatch[1]!));
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const storageTestMatch = /^\/api\/storage\/backends\/([^/]+)\/test$/.exec(path);
+    if (storageTestMatch && method === 'POST') {
+      return sendJson(res, 200, await app.testStorageBackend(decodeURIComponent(storageTestMatch[1]!)));
+    }
+
+    const storageDefaultMatch = /^\/api\/storage\/backends\/([^/]+)\/default$/.exec(path);
+    if (storageDefaultMatch && method === 'POST') {
+      return sendJson(res, 200, app.setDefaultStorageBackend(decodeURIComponent(storageDefaultMatch[1]!)));
     }
 
     return sendJson(res, 404, { error: { code: 'NOT_FOUND', message: `Unknown endpoint: ${method} ${path}` } });

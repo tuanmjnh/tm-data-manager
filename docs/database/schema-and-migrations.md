@@ -3,14 +3,14 @@
 Engine: SQLite via `node:sqlite`. WAL journal, `foreign_keys=ON`, `busy_timeout=5000`.
 Location: `<data-dir>/udmt.db` (`UDMT_DATA_DIR` overrides the data dir).
 
-## Tables (version 1 + 2)
+## Tables (version 1–3)
 
 | Table | Purpose |
 |---|---|
 | `schema_migrations` | applied versions (patched with `applied_at` for old DBs) |
 | `connections` | name, provider, service profile, non-secret config, `credential_ref`, environment, test state |
 | `secrets` | encrypted credential payloads (AES-256-GCM) |
-| `storage_backends` | local artifact roots; `local-default` is seeded |
+| `storage_backends` | artifact backends (`local`, `s3`), sanitized endpoint hint and last test state; `local-default` is seeded |
 | `jobs` | reusable export/import job definitions (schedulable) |
 | `job_schedules` | type/config/timezone/misfire/overlap/next_run_at |
 | `operation_runs` | durable run state, progress, result, error, worker id |
@@ -23,6 +23,9 @@ Location: `<data-dir>/udmt.db` (`UDMT_DATA_DIR` overrides the data dir).
 | `legacy_imports` | raw rows preserved from the pre-UDMT schema |
 
 Indexes: run list/status, logs by run, artifacts by creation/expiry, schedules due.
+
+Migration v3 (`storage-backend-health`) adds `endpoint_hint`, `last_tested_at` and `last_test_status` to
+`storage_backends`; it is additive and idempotent for pre-existing catalogs.
 
 ## Migration policy
 
