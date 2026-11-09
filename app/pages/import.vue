@@ -17,7 +17,7 @@ const resource = ref('')
 const sourceMode = ref<'artifact' | 'file'>('artifact')
 const artifactId = ref('')
 const filePath = ref('')
-const format = ref<'' | 'jsonl' | 'csv' | 'json'>('')
+const format = ref<'' | 'jsonl' | 'csv' | 'json' | 'xml' | 'xlsx'>('')
 const mode = ref<'append' | 'upsert' | 'truncate_and_load'>('append')
 const keyColumns = ref('')
 const dryRun = ref(false)
@@ -312,7 +312,7 @@ const warnings = computed(() => (run.value?.result?.warnings as string[] | undef
               <UFormField :label="$t('importPage.formatOverride')" :help="$t('importPage.formatAutoHelp')">
                 <USelect
                   v-model="format"
-                  :items="[{ value: '', label: $t('importPage.auto') }, { value: 'jsonl', label: 'JSONL' }, { value: 'csv', label: 'CSV' }, { value: 'json', label: 'JSON' }]"
+                  :items="[{ value: '', label: $t('importPage.auto') }, { value: 'jsonl', label: 'JSONL' }, { value: 'csv', label: 'CSV' }, { value: 'json', label: 'JSON' }, { value: 'xml', label: 'XML' }, { value: 'xlsx', label: 'XLSX' }]"
                   class="w-full"
                 />
               </UFormField>

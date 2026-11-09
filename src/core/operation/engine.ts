@@ -43,7 +43,7 @@ import { EXPORT_FORMATS } from '../types.js';
 const ExportSchema = z.object({
   connection_id: z.string().min(1),
   resource: z.string().min(1),
-  format: z.enum(['jsonl', 'csv', 'json']),
+  format: z.enum(['jsonl', 'csv', 'json', 'xml', 'xlsx']),
   compression: z.enum(['none', 'gzip']),
   output_dir: z.string().optional(),
   limit: z.number().int().positive().optional(),
@@ -57,7 +57,7 @@ const ImportSchema = z.object({
   connection_id: z.string().min(1),
   resource: z.string().min(1),
   source: z.object({ artifact_id: z.string().optional(), path: z.string().optional() }),
-  format: z.enum(['jsonl', 'csv', 'json']).optional(),
+  format: z.enum(['jsonl', 'csv', 'json', 'xml', 'xlsx']).optional(),
   mode: z.enum(['append', 'upsert', 'truncate_and_load']),
   key_columns: z.array(z.string().min(1)).optional(),
   batch_size: z.number().int().min(1).max(5000).optional(),

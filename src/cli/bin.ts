@@ -143,6 +143,8 @@ function connectionConfigFromFlags(provider: string, options: Record<string, unk
     case 'sqlite':
       if (!options.path) throw new UdmtError('INVALID_INPUT', 'SQLite needs --path <file> or --config <json>.');
       return { path: String(options.path), read_only: options.readOnly !== false };
+    case 'rest':
+      throw new UdmtError('INVALID_INPUT', 'REST needs --config <json> with base_url; see docs/provider-contract/rest-connector.md.');
     case 'mongodb':
       if (!options.uri) throw new UdmtError('INVALID_INPUT', 'MongoDB needs --uri <connection string>.');
       return {
@@ -269,16 +271,26 @@ connection
   .option('--user <name>')
   .option('--password <password>', 'prefer --password-stdin to keep it out of shell history')
   .option('--password-stdin', 'read the password from stdin')
+  .option('--token <token>', 'REST bearer token (stored in the vault)')
+  .option('--api-key <key>', 'REST API key (stored in the vault)')
   .option('--ssl <mode>', 'require|verify-full|disable')
   .option('--url <url>', 'postgres/mysql connection URL (password is moved to the vault)')
   .action(async (options: Record<string, unknown>) => {
     await main(async () => {
       const password = await resolvePassword(options);
       await withApp((app) => {
-        const config = connectionConfigFromFlags(String(options.provider), options);
+        const provider = String(options.provider);
+        const config: Record<string, unknown> = connectionConfigFromFlags(provider, options);
+        // REST credentials are passed inline so normalizeInlineSecret moves them to the vault.
+        if (provider === 'rest') {
+          if (typeof options.token === 'string' && options.token) config.bearer_token = options.token;
+          else if (typeof options.apiKey === 'string' && options.apiKey) config.api_key = options.apiKey;
+          else if (password) config.bearer_token = password;
+          if (typeof options.user === 'string' && options.user && !config.username) config.username = options.user;
+        }
         const created = app.createConnection({
           name: String(options.name),
-          provider_id: String(options.provider),
+          provider_id: provider,
           service_profile: (options.profile as string | undefined) ?? null,
           config,
           secret: password ? { password } : {},
@@ -431,7 +443,7 @@ program
   .description('Export a resource to CSV/JSONL/JSON')
   .requiredOption('--conn <connection>')
   .requiredOption('--resource <resource>', 'e.g. main.users or app.customers')
-  .addOption(new Option('--format <format>', 'output format').choices(['jsonl', 'csv', 'json']).default('jsonl'))
+  .addOption(new Option('--format <format>', 'output format').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']).default('jsonl'))
   .addOption(new Option('--compression <mode>', 'none|gzip').choices(['none', 'gzip']).default('none'))
   .option('--out <directory>', 'output directory (defaults to the managed artifacts root)')
   .option('--limit <n>', 'maximum rows to export', (value) => Number(value))
@@ -473,7 +485,7 @@ program
   .requiredOption('--resource <resource>', 'target resource, e.g. main.users')
   .option('--from <path>', 'source CSV/JSONL/JSON file')
   .option('--artifact <id>', 'source artifact id')
-  .addOption(new Option('--format <format>', 'source format when importing a file').choices(['jsonl', 'csv', 'json']))
+  .addOption(new Option('--format <format>', 'source format when importing a file').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']))
   .addOption(new Option('--mode <mode>', 'load mode').choices(['append', 'upsert', 'truncate_and_load']).default('append'))
   .option('--key-columns <list>', 'upsert key columns (comma separated)')
   .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
@@ -1132,7 +1144,7 @@ job
   .requiredOption('--name <name>')
   .requiredOption('--conn <connection>')
   .requiredOption('--resource <resource>')
-  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json']).default('jsonl'))
+  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']).default('jsonl'))
   .addOption(new Option('--compression <mode>').choices(['none', 'gzip']).default('gzip'))
   .option('--out <directory>')
   .option('--batch-size <n>', 'rows per batch', (value) => Number(value))
@@ -1172,7 +1184,7 @@ job
   .requiredOption('--conn <connection>')
   .requiredOption('--resource <resource>')
   .requiredOption('--from <path>')
-  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json']))
+  .addOption(new Option('--format <format>').choices(['jsonl', 'csv', 'json', 'xml', 'xlsx']))
   .addOption(new Option('--mode <mode>').choices(['append', 'upsert', 'truncate_and_load']).default('append'))
   .option('--key-columns <list>')
   .option('--confirm <connection_name>')

@@ -14,8 +14,13 @@ const loadingSchema = ref(false)
 
 const connectionId = ref('')
 const resource = ref('')
-const format = ref<'jsonl' | 'csv' | 'json'>('jsonl')
+const format = ref<'jsonl' | 'csv' | 'json' | 'xml' | 'xlsx'>('jsonl')
 const compression = ref<'none' | 'gzip'>('gzip')
+
+watch(format, (next) => {
+  // XLSX is already a zip container; wrapping it in gzip is rejected by the core.
+  if (next === 'xlsx') compression.value = 'none'
+})
 const limit = ref<number | undefined>(undefined)
 const batchSize = ref<number>(1000)
 const outputDir = ref('')
@@ -190,7 +195,7 @@ async function cancel() {
 
           <div class="grid gap-4 sm:grid-cols-3">
             <UFormField :label="$t('exportPage.format')">
-              <USelect v-model="format" :items="['jsonl', 'csv', 'json']" class="w-full" />
+              <USelect v-model="format" :items="['jsonl', 'csv', 'json', 'xml', 'xlsx']" class="w-full" />
             </UFormField>
             <UFormField :label="$t('exportPage.compression')">
               <USelect v-model="compression" :items="['gzip', 'none']" class="w-full" />

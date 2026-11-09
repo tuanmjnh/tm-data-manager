@@ -802,7 +802,7 @@ export class UdmtApp {
     name: string;
     connection_id: string;
     resource: string;
-    format: 'jsonl' | 'csv' | 'json';
+    format: 'jsonl' | 'csv' | 'json' | 'xml' | 'xlsx';
     compression?: 'none' | 'gzip';
     output_dir?: string;
     batch_size?: number;
@@ -833,7 +833,7 @@ export class UdmtApp {
     connection_id: string;
     resource: string;
     source_path: string;
-    format?: 'jsonl' | 'csv' | 'json';
+    format?: 'jsonl' | 'csv' | 'json' | 'xml' | 'xlsx';
     mode: 'append' | 'upsert' | 'truncate_and_load';
     key_columns?: string[];
     confirm?: string;
@@ -997,6 +997,22 @@ export function normalizeInlineSecret(
     if (providerId === 'postgresql' && typeof nextConfig.connection_string === 'string') {
       return normalizeInlineSecret(providerId, { ...nextConfig, url: nextConfig.connection_string }, nextSecret);
     }
+    if (providerId === 'rest') {
+      // REST secrets can only be supplied at creation/inline time; they are moved before
+      // validation so they never reach the stored config.
+      for (const [inlineKey, secretKey] of [
+        ['bearer_token', 'token'],
+        ['api_key', 'api_key'],
+        ['user', 'username'],
+        ['basic_password', 'password'],
+      ] as const) {
+        if (nextConfig[inlineKey] !== undefined && nextSecret[secretKey] === undefined) {
+          nextSecret[secretKey] = nextConfig[inlineKey];
+          delete nextConfig[inlineKey];
+        }
+      }
+    }
+
   } catch (error) {
     throw new UdmtError('INVALID_CONFIG', `Could not parse the connection URL: ${(error as Error).message}`, {
       cause: error,

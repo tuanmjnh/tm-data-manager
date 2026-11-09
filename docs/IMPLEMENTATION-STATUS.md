@@ -312,6 +312,86 @@ same contract but were not run against live servers here)
 ```
 
 ```
+PHASE: 6 — File/API connectors
+STATUS: completed for XML/XLSX formats and the REST (JSON) connector (tested against local XML/XLSX
+files and a real local HTTP server; no live third-party API was available here)
+
+1. Implemented
+- Format adapters extended with XML and XLSX alongside CSV/JSONL/JSON, in both directions:
+  - XML: a self-describing `<rows><row><field name=".." type="..">value</field></row></rows>` writer
+    (typed values, nested JSON, nulls, escaped text); the reader also accepts generic `<rows><row>`
+    documents where child element names become columns. Gzip is supported for XML.
+  - XLSX: streaming `exceljs` workbook writer with a header row, and a typed cell reader (dates to ISO,
+    rich text/formula results normalized). Gzip is rejected up front because XLSX is already a zip
+    container.
+  - `detectFormat`/`defaultExtension`/CLI `--format` choices/export+import GUI selectors all include
+    `xml` and `xlsx`; the export GUI switches compression to `none` when XLSX is selected.
+- REST (JSON) provider (`rest`) registered as a first-class built-in provider with real capabilities:
+  - Config: `base_url`, optional `resources` list, `items_path`, extra non-secret `headers`,
+    `auth_type` (`none`/`bearer`/`api_key`/`basic`), `auth_header`/`auth_query_param`, `username`,
+    pagination (`none`/`page`/`offset`/`cursor`/`link` with param names, page size and `next_path`),
+    timeout, `rate_limit_per_minute`, retry attempts/backoff, `write_method`/`write_path`/`write_batch`.
+  - Credentials (`token`, `api_key`, `password`) are moved out of the config into the encrypted vault
+    by `normalizeInlineSecret`; the endpoint hint and diagnostics never contain them.
+  - `testConnection`, `discoverResources` (from the configured list), `readSchema` (samples up to 5
+    rows), streaming `readRows` with all pagination modes, rate limiting and retry (honours
+    `Retry-After`, retries 429/5xx/network, maps 401/403→`AUTH_FAILED`, 404→`NOT_FOUND`), and append
+    `writeRows` (`upsert`/`truncate_and_load` are refused, not faked).
+  - Redirects are not followed and pagination links must stay on the configured origin (no SSRF).
+- Sources/sinks compose with the existing engine: REST → file artifact → SQLite and REST POST writes
+  all work through the normal export/import paths with capability checks and checksummed artifacts.
+- CLI: `connection add --provider rest --config <json> [--token|--api-key|--password-stdin]`.
+- GraphQL is intentionally not implemented (no use case requested in this environment) rather than
+  shipping an untested stub.
+
+2. Files changed
+- `src/core/formats/index.ts`, `src/core/types.ts`, `src/core/operation/engine.ts`,
+  `src/core/service.ts` (inline REST secrets), `src/core/providers/rest.ts` (new),
+  `src/core/providers/registry.ts`, `src/cli/bin.ts`, `app/pages/export.vue`, `app/pages/import.vue`,
+  `tests/unit/formats-xml-xlsx.test.ts` (new), `tests/integration/rest-connector.test.ts` (new),
+  `package.json`/`pnpm-lock.yaml` (exceljs, fast-xml-parser),
+  `docs/provider-contract/rest-connector.md` (new), this file, `docs/architecture/target-architecture.md`.
+
+3. Database migrations
+- none (formats and providers add no tables; REST secrets use the existing vault).
+
+4. Tests executed
+- `pnpm run typecheck` clean; `pnpm test` 76/76 passing; `pnpm run check:i18n` clean; server + GUI build.
+- Unit (4): XML round-trip of typed values/nested JSON/nulls/escaped text, generic XML parsing, XLSX
+  write+read with manifest coercion, XLSX gzip rejection.
+- Integration (6, real HTTP server): config/endpoint secrecy, authenticated paginated connection test,
+  auth-failure without leaking the secret, API key sent in a header (never the URL), missing-credential
+  rejection, and REST→JSONL artifact→SQLite import over multiple pages.
+
+5. Manual verification
+- Real CLI round trip: SQLite (20 rows) → `--format xml` and `--format xlsx` exports (checksums
+  verified), XLSX re-imported into a fresh SQLite table (20 rows, `id/name/score/ok` typed correctly,
+  `Name <3> & co` preserved).
+- Real CLI + real local HTTP API (12 rows, bearer auth, page size 5): `connection test` OK with token
+  and FAILED HTTP 401 with a wrong token (both without echoing the secret); `export --conn posts-api
+  --format csv` produced 12 rows across 3 pages; `import` into SQLite wrote 12 typed rows.
+- Fixed a real CLI gap found here: REST credentials could not be supplied through `connection add`;
+  `--token`/`--api-key` and inline bearer/API-key/base64 handling were added and re-verified.
+
+6. Known limitations / risks
+- REST `writeRows` is append-only; upsert/truncate must be implemented by the API (documented, refused
+  when requested).
+- XML/XLSX readers load the whole document into memory (CSV/JSONL/JSON remain streaming); not suitable
+  for multi-GB workbooks. XLSX cannot be read from a `.gz`.
+- Generic XML documents without a manifest are read as strings and rely on the import manifest to
+  coerce types (our own XML export embeds `type` attributes and round-trips exactly).
+- REST `items_path`/pagination settings are per connection; a single connection to an API with many
+  differently-shaped endpoints needs multiple connections.
+- No live third-party API, TLS pinning, OAuth2 refresh or GraphQL here; rate limiting is client-side
+  and per process.
+- No HTML/`multipart` format, no server-side pagination by `total`, no request signing beyond the four
+  auth modes.
+
+7. Next recommended phase
+- Phase 7 — External plugin SDK & plugin host.
+```
+
+```
 PHASE: GUI (roadmap section 14, delivered with Phase 1–3)
 STATUS: completed for the implemented features
 
@@ -420,7 +500,7 @@ STATUS: completed and built end-to-end on Windows
 | Gate | Result |
 |---|---|
 | Release target builds | ✅ `pnpm run build` + `nuxt generate` + `tauri build` (NSIS installer) |
-| Important tests pass | ✅ 44/44 vitest + 4/4 cargo |
+| Important tests pass | ✅ 76/76 vitest + 4/4 cargo |
 | UI actions wired to a real backend | ✅ no mock data in the app |
 | Task state persisted | ✅ SQLite runs/logs |
 | No secret in logs/DB plaintext | ✅ tested |

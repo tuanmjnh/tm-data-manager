@@ -191,8 +191,8 @@ export interface ArtifactManifest {
   output_mode?: 'managed' | 'external';
 }
 
-export type ExportFormat = 'jsonl' | 'csv' | 'json';
-export const EXPORT_FORMATS: ExportFormat[] = ['jsonl', 'csv', 'json'];
+export type ExportFormat = 'jsonl' | 'csv' | 'json' | 'xml' | 'xlsx';
+export const EXPORT_FORMATS: ExportFormat[] = ['jsonl', 'csv', 'json', 'xml', 'xlsx'];
 export type Compression = 'none' | 'gzip';
 
 export type OperationType = 'export' | 'import' | 'verify' | 'sync';
