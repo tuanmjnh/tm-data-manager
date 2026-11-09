@@ -5,7 +5,7 @@ import { fileURLToPath } from 'node:url';
 import { UdmtError, toUdmtError } from '../core/errors.js';
 import type { UdmtApp } from '../core/service.js';
 import { nowIso } from '../core/utils.js';
-import type { ExportRequest, ImportRequest, SyncRequest } from '../core/types.js';
+import type { ExportRequest, ImportRequest, PluginPermission, SyncRequest } from '../core/types.js';
 
 export interface ApiServerHandle {
   url: string;
@@ -285,6 +285,45 @@ async function handle(app: UdmtApp, req: IncomingMessage, res: ServerResponse): 
     const syncStateMatch = /^\/api\/sync\/pipelines\/([^/]+)\/state$/.exec(path);
     if (syncStateMatch && method === 'GET') {
       return sendJson(res, 200, app.syncState(decodeURIComponent(syncStateMatch[1]!)));
+    }
+
+    if (path === '/api/plugins' && method === 'GET') {
+      return sendJson(res, 200, app.listPlugins());
+    }
+    if (path === '/api/plugins' && method === 'POST') {
+      const body = await readJson(req);
+      return sendJson(res, 201, app.installPlugin(body as never));
+    }
+
+    const pluginMatch = /^\/api\/plugins\/([^/]+)$/.exec(path);
+    if (pluginMatch && method === 'GET') {
+      const id = decodeURIComponent(pluginMatch[1]!);
+      return sendJson(res, 200, { plugin: app.getPlugin(id), diagnostics: app.pluginDiagnostics(id) });
+    }
+    if (pluginMatch && method === 'PATCH') {
+      const id = decodeURIComponent(pluginMatch[1]!);
+      const body = (await readJson(req)) as {
+        enabled?: boolean;
+        trusted?: boolean;
+        granted_permissions?: PluginPermission[];
+      };
+      let record = app.getPlugin(id);
+      if (body.trusted !== undefined) record = app.setPluginTrust(id, { trusted: body.trusted, ...(body.granted_permissions ? { granted_permissions: body.granted_permissions } : {}) });
+      if (body.enabled !== undefined) record = app.setPluginEnabled(id, body.enabled);
+      return sendJson(res, 200, record);
+    }
+    if (pluginMatch && method === 'DELETE') {
+      app.removePlugin(decodeURIComponent(pluginMatch[1]!));
+      return sendJson(res, 200, { deleted: true });
+    }
+
+    const pluginUpdateMatch = /^\/api\/plugins\/([^/]+)\/update$/.exec(path);
+    if (pluginUpdateMatch && method === 'POST') {
+      return sendJson(res, 200, app.updatePlugin(decodeURIComponent(pluginUpdateMatch[1]!)));
+    }
+    const pluginTestMatch = /^\/api\/plugins\/([^/]+)\/test$/.exec(path);
+    if (pluginTestMatch && method === 'POST') {
+      return sendJson(res, 200, await app.testPlugin(decodeURIComponent(pluginTestMatch[1]!)));
     }
 
     if (path === '/api/artifacts' && method === 'GET') {

@@ -47,6 +47,9 @@ const links = computed<NavigationMenuItem[][]>(() => [
     { label: t('nav.sync'), icon: 'i-lucide-arrow-right-left', to: '/sync', active: route.path === '/sync' },
   ],
   [
+    { label: t('nav.plugins'), icon: 'i-lucide-puzzle', to: '/plugins', active: route.path === '/plugins' },
+  ],
+  [
     { label: t('nav.operations'), icon: 'i-lucide-activity', to: '/operations', active: route.path.startsWith('/operations') },
     { label: t('nav.schedules'), icon: 'i-lucide-calendar-clock', to: '/schedules', active: route.path === '/schedules' },
   ],

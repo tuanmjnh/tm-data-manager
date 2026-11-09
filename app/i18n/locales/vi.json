@@ -16,7 +16,8 @@
     "operations": "Tác vụ",
     "schedules": "Lịch chạy",
     "system": "Hệ thống",
-    "docs": "Tài liệu"
+    "docs": "Tài liệu",
+    "plugins": "Plugin"
   },
   "common": {
     "loading": "Đang tải…",
@@ -631,5 +632,46 @@
       "reference": "Tham chiếu",
       "other": "Khác"
     }
+  },
+  "pluginsPage": {
+    "title": "Plugin",
+    "subtitle": "Cài đặt và cấp quyền cho provider bên ngoài chạy trong tiến trình riêng",
+    "installTitle": "Cài đặt plugin",
+    "installHelp": "Trỏ tới thư mục chứa udmt-plugin.json. Plugin bắt đầu ở trạng thái tắt và chưa được tin cậy.",
+    "installPlaceholder": "D:\\plugins\\my-provider",
+    "install": "Cài đặt",
+    "installed": "Đã cài đặt plugin",
+    "installFailed": "Cài đặt thất bại",
+    "installedTitle": "Plugin đã cài đặt",
+    "empty": "Chưa có plugin nào.",
+    "untrusted": "Chưa tin cậy",
+    "requested": "Yêu cầu",
+    "granted": "Đã cấp",
+    "enabled": "Bật",
+    "enabledDone": "Đã bật plugin",
+    "disabledDone": "Đã tắt plugin",
+    "review": "Xem quyền",
+    "untrust": "Thu hồi",
+    "trusted": "Đã tin cậy plugin",
+    "revoked": "Đã thu hồi quyền",
+    "test": "Kiểm tra",
+    "testOk": "Bắt tay thành công",
+    "testFailed": "Bắt tay thất bại",
+    "update": "Cập nhật",
+    "updated": "Đã cập nhật plugin",
+    "removed": "Đã gỡ plugin",
+    "actionFailed": "Thao tác thất bại",
+    "loadFailed": "Không tải được danh sách plugin",
+    "trustTitle": "Cấp quyền",
+    "trustHelp": "Plugin chỉ chạy với các quyền bạn cấp. Thu hồi quyền để dừng plugin.",
+    "permReadConfig": "Đọc cấu hình kết nối",
+    "permReadSecrets": "Đọc thông tin đăng nhập đã lưu",
+    "permNetwork": "Thực hiện yêu cầu mạng",
+    "permFilesystem": "Đọc và ghi tệp",
+    "permWriteData": "Ghi vào nguồn dữ liệu đích",
+    "noPermissions": "Plugin này không yêu cầu quyền nào.",
+    "grantAndTrust": "Cấp quyền và tin cậy",
+    "removeTitle": "Gỡ plugin",
+    "removeHelp": "Plugin được gỡ khỏi danh sách; tệp vẫn còn trên đĩa."
   }
 }

@@ -3,7 +3,7 @@
 Engine: SQLite via `node:sqlite`. WAL journal, `foreign_keys=ON`, `busy_timeout=5000`.
 Location: `<data-dir>/udmt.db` (`UDMT_DATA_DIR` overrides the data dir).
 
-## Tables (version 1–4)
+## Tables (version 1–5)
 
 | Table | Purpose |
 |---|---|
@@ -24,6 +24,7 @@ Location: `<data-dir>/udmt.db` (`UDMT_DATA_DIR` overrides the data dir).
 | `sync_pipelines` | source/target connection + resource, mapping JSON, load mode, key columns, options, enabled |
 | `sync_states` | last run/status, cumulative rows and the JSON checkpoint per pipeline |
 | `sync_run_errors` | persisted per-row sync errors (batch, row index, code, sanitized message) |
+| `plugins` | installed external providers: manifest, install path, enabled/trusted flags, requested/granted permissions, status |
 
 Indexes: run list/status, logs by run, artifacts by creation/expiry, schedules due, sync pipelines by
 source/target, sync errors by run.
@@ -35,6 +36,10 @@ Migration v4 (`sync-engine`) creates `sync_pipelines`, `sync_states` and `sync_r
 are new and cascade (`ON DELETE CASCADE`) from connections/pipelines/runs; no existing table or row is
 rewritten. `sync_states.checkpoint_json` is versioned (`checkpoint_version: 1`) so later incremental
 watermark fields can be added without a destructive migration.
+
+Migration v5 (`external-plugins`) creates `plugins`. It is new and additive; a plugin record holds the
+validated manifest, the folder it was installed from and the trust/permission decision, so trust never
+depends on the plugin's own files remaining unchanged (the manifest is re-read on `plugin update`).
 
 ## Migration policy
 

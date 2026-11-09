@@ -372,6 +372,32 @@ const MIGRATIONS: Migration[] = [
       `);
     },
   },
+  {
+    version: 5,
+    name: 'external-plugins',
+    up: (db) => {
+      db.exec(`
+        CREATE TABLE IF NOT EXISTS plugins (
+          id TEXT PRIMARY KEY,
+          name TEXT NOT NULL,
+          version TEXT NOT NULL,
+          protocol_version TEXT NOT NULL,
+          description TEXT NULL,
+          manifest_json TEXT NOT NULL,
+          install_path TEXT NOT NULL,
+          enabled INTEGER NOT NULL DEFAULT 0,
+          trusted INTEGER NOT NULL DEFAULT 0,
+          requested_permissions_json TEXT NOT NULL,
+          granted_permissions_json TEXT NOT NULL,
+          status TEXT NOT NULL DEFAULT 'disabled',
+          last_error TEXT NULL,
+          last_handshake_at TEXT NULL,
+          installed_at TEXT NOT NULL,
+          updated_at TEXT NOT NULL
+        );
+      `);
+    },
+  },
 ];
 
 export function runMigrations(db: Db): number {

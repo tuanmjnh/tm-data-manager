@@ -12,7 +12,7 @@ import { createStorageBackend as buildStorageBackend, managedLocalBackend } from
 import type { StorageBackend } from './storage/contract.js';
 import { OperationEngine } from './operation/engine.js';
 import { describeSchedule, nextRunAt, validateSchedule, type ScheduleInput } from './scheduler.js';
-import { UdmtError, toUdmtError } from './errors.js';
+import { UdmtError, sanitizeErrorMessage, toUdmtError } from './errors.js';
 import { APP_VERSION, newId, nowIso, sanitizeName, sha256File, truncate } from './utils.js';
 import type {
   ArtifactRecord,
@@ -30,6 +30,9 @@ import type {
   ProviderDescriptor,
   ResourceDescriptor,
   ResourceSchema,
+  PluginPermission,
+  PluginRecord,
+  PluginTestResult,
   RowBatch,
   RowsPreview,
   ScheduleRecord,
@@ -45,7 +48,9 @@ import type {
   SyncStateRecord,
   WorkerInstance,
 } from './types.js';
-import { ENVIRONMENTS, PREVIEW_ROW_LIMIT, STORAGE_BACKEND_TYPES, SYNC_LOAD_MODES } from './types.js';
+import { ENVIRONMENTS, PLUGIN_PERMISSIONS, PREVIEW_ROW_LIMIT, STORAGE_BACKEND_TYPES, SYNC_LOAD_MODES, pluginProviderId } from './types.js';
+import { readPluginManifest } from './plugins/manifest.js';
+import { ExternalProvider } from './plugins/provider.js';
 
 export interface CreateSyncPipelineInput {
   name: string;
@@ -118,6 +123,7 @@ export class UdmtApp {
   /** Always-present local backend; used for staging and safe fallback. */
   readonly managedStorage: LocalStorageBackend;
   readonly engine: OperationEngine;
+  private readonly externalProviders = new Map<string, ExternalProvider>();
 
   constructor(options: { dataDir?: string } = {}) {
     this.paths = resolveAppPaths(options.dataDir);
@@ -136,6 +142,7 @@ export class UdmtApp {
         managedStorage: this.managedStorage,
         resolveStorage: (idOrName) => this.storageBackend(idOrName),
       });
+      this.loadPlugins();
     } catch (error) {
       // Never leak a locked metadata database when startup fails.
       this.db.close();
@@ -144,6 +151,7 @@ export class UdmtApp {
   }
 
   close(): void {
+    for (const provider of this.externalProviders.values()) void provider.shutdown();
     this.db.close();
   }
 
@@ -316,6 +324,187 @@ export class UdmtApp {
       truncated: rows.length >= limit,
       latency_ms: Date.now() - startedAt,
     };
+  }
+
+  // ------------------------------------------------------------------ plugins
+  private loadPlugins(): void {
+    for (const record of this.store.listPlugins()) {
+      if (record.enabled && record.trusted && record.status !== 'error') {
+        this.registerPluginProvider(record);
+      }
+    }
+  }
+
+  private registerPluginProvider(record: PluginRecord): ExternalProvider {
+    const provider = new ExternalProvider(record);
+    this.registry.register(provider);
+    this.externalProviders.set(record.id, provider);
+    return provider;
+  }
+
+  private unregisterPluginProvider(id: string): void {
+    const existing = this.externalProviders.get(id);
+    if (existing) {
+      void existing.shutdown();
+      this.externalProviders.delete(id);
+    }
+    this.registry.remove(pluginProviderId(id));
+  }
+
+  listPlugins(): PluginRecord[] {
+    return this.store.listPlugins();
+  }
+
+  getPlugin(id: string): PluginRecord {
+    return this.store.requirePlugin(id);
+  }
+
+  /**
+   * Installs a plugin from a local folder containing `udmt-plugin.json`. Plugins
+   * start disabled and untrusted: nothing is executed and no provider is exposed
+   * until the user grants the requested permissions.
+   */
+  installPlugin(input: { path: string; enabled?: boolean; trusted?: boolean; granted_permissions?: PluginPermission[] }): PluginRecord {
+    const { manifest, installPath } = readPluginManifest(input.path);
+    if (this.store.getPlugin(manifest.id)) {
+      throw new UdmtError('ALREADY_EXISTS', `Plugin "${manifest.id}" is already installed. Use update instead.`);
+    }
+    const requested = manifest.permissions ?? [];
+    const granted = this.resolveGrantedPermissions(requested, input.granted_permissions ?? (input.trusted ? requested : []));
+    const trusted = input.trusted ?? false;
+    const enabled = input.enabled ?? false;
+    const record = this.store.createPlugin({
+      id: manifest.id,
+      name: manifest.name,
+      version: manifest.version,
+      protocol_version: manifest.protocol,
+      description: manifest.description ?? null,
+      manifest,
+      install_path: installPath,
+      enabled,
+      trusted,
+      requested_permissions: requested,
+      granted_permissions: granted,
+      status: enabled && trusted ? 'installed' : 'disabled',
+    });
+    this.store.audit('plugin.installed', { plugin: record.id, version: record.version, trusted: record.trusted });
+    if (record.enabled && record.trusted) this.registerPluginProvider(record);
+    return record;
+  }
+
+  updatePlugin(id: string): PluginRecord {
+    const existing = this.store.requirePlugin(id);
+    const { manifest, installPath } = readPluginManifest(existing.install_path);
+    if (manifest.id !== existing.id) {
+      throw new UdmtError('INVALID_INPUT', `Manifest id "${manifest.id}" does not match the installed plugin "${existing.id}".`);
+    }
+    const requested = manifest.permissions ?? [];
+    const granted = this.resolveGrantedPermissions(requested, existing.granted_permissions);
+    const updated = this.store.updatePlugin(existing.id, {
+      name: manifest.name,
+      version: manifest.version,
+      protocol_version: manifest.protocol,
+      description: manifest.description ?? null,
+      manifest,
+      install_path: installPath,
+      requested_permissions: requested,
+      granted_permissions: granted,
+      status: existing.enabled && existing.trusted ? 'installed' : 'disabled',
+    });
+    this.unregisterPluginProvider(id);
+    if (updated.enabled && updated.trusted) this.registerPluginProvider(updated);
+    this.store.audit('plugin.updated', { plugin: updated.id, version: updated.version });
+    return updated;
+  }
+
+  setPluginTrust(id: string, input: { trusted: boolean; granted_permissions?: PluginPermission[] }): PluginRecord {
+    const existing = this.store.requirePlugin(id);
+    const granted = input.trusted
+      ? this.resolveGrantedPermissions(existing.requested_permissions, input.granted_permissions ?? existing.requested_permissions)
+      : [];
+    const updated = this.store.updatePlugin(id, {
+      trusted: input.trusted,
+      granted_permissions: granted,
+      status: existing.enabled && input.trusted ? 'installed' : 'disabled',
+      last_error: null,
+    });
+    this.unregisterPluginProvider(id);
+    if (updated.enabled && updated.trusted) this.registerPluginProvider(updated);
+    this.store.audit('plugin.trust_changed', { plugin: id, trusted: input.trusted, granted });
+    return updated;
+  }
+
+  setPluginEnabled(id: string, enabled: boolean): PluginRecord {
+    const existing = this.store.requirePlugin(id);
+    if (enabled && !existing.trusted) {
+      throw new UdmtError('PRECONDITION_FAILED', `Plugin "${id}" must be trusted before it can be enabled.`);
+    }
+    const updated = this.store.updatePlugin(id, {
+      enabled,
+      status: enabled ? 'installed' : 'disabled',
+      last_error: null,
+    });
+    this.unregisterPluginProvider(id);
+    if (updated.enabled && updated.trusted) this.registerPluginProvider(updated);
+    this.store.audit(enabled ? 'plugin.enabled' : 'plugin.disabled', { plugin: id });
+    return updated;
+  }
+
+  removePlugin(id: string): void {
+    this.store.requirePlugin(id);
+    this.unregisterPluginProvider(id);
+    this.store.deletePlugin(id);
+    this.store.audit('plugin.removed', { plugin: id });
+  }
+
+  /** Handshakes the plugin process and reports protocol/version/capabilities. */
+  async testPlugin(id: string): Promise<PluginTestResult> {
+    const record = this.store.requirePlugin(id);
+    if (!record.trusted) throw new UdmtError('PRECONDITION_FAILED', `Plugin "${id}" is not trusted.`);
+    const provider = new ExternalProvider(record);
+    const startedAt = Date.now();
+    try {
+      const logs = await provider.reset();
+      this.store.updatePlugin(id, { status: 'installed', last_error: null, last_handshake_at: nowIso() });
+      return {
+        success: true,
+        protocol_version: record.protocol_version,
+        server: { name: record.name, version: record.version },
+        capabilities: record.manifest.provider.capabilities,
+        latency_ms: Date.now() - startedAt,
+        diagnostics: logs.slice(-10).map((line) => sanitizePluginLine(line)),
+        tested_at: nowIso(),
+      };
+    } catch (error) {
+      const udmt = toUdmtError(error, 'CONNECTION_FAILED');
+      this.store.updatePlugin(id, { status: 'error', last_error: udmt.message });
+      return {
+        success: false,
+        protocol_version: null,
+        server: null,
+        capabilities: [],
+        latency_ms: Date.now() - startedAt,
+        diagnostics: [sanitizePluginLine(udmt.message)],
+        tested_at: nowIso(),
+      };
+    } finally {
+      await provider.shutdown();
+    }
+  }
+
+  pluginDiagnostics(id: string): string[] {
+    const provider = this.externalProviders.get(id);
+    return (provider?.diagnostics() ?? []).map((line) => sanitizePluginLine(line));
+  }
+
+  private resolveGrantedPermissions(requested: PluginPermission[], granted: PluginPermission[]): PluginPermission[] {
+    const unknown = granted.filter((permission) => !PLUGIN_PERMISSIONS.includes(permission));
+    if (unknown.length > 0) throw new UdmtError('INVALID_INPUT', `Unknown plugin permission: ${unknown.join(', ')}`);
+    const extra = granted.filter((permission) => !requested.includes(permission));
+    if (extra.length > 0) {
+      throw new UdmtError('INVALID_INPUT', `Plugin did not request these permissions: ${extra.join(', ')}`);
+    }
+    return [...new Set(granted)];
   }
 
   // ------------------------------------------------------------------ operations
@@ -962,6 +1151,10 @@ export class UdmtApp {
 
 function isTerminal(status: OperationRun['status']): boolean {
   return ['completed', 'completed_with_warnings', 'failed', 'cancelled', 'interrupted'].includes(status);
+}
+
+function sanitizePluginLine(line: string): string {
+  return sanitizeErrorMessage(line).slice(0, 500);
 }
 
 /**

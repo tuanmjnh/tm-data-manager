@@ -405,6 +405,79 @@ export interface SyncRunError {
   created_at: string;
 }
 
+export type PluginPermission = 'read_config' | 'read_secrets' | 'network' | 'filesystem' | 'write_data';
+export const PLUGIN_PERMISSIONS: PluginPermission[] = ['read_config', 'read_secrets', 'network', 'filesystem', 'write_data'];
+
+/** Version of the external provider wire protocol. Bump only with a compatibility plan. */
+export const PLUGIN_PROTOCOL_VERSION = 'udmt-provider/1';
+
+/** Externally-installed providers are namespaced so they can never shadow a built-in provider id. */
+export function pluginProviderId(pluginId: string): string {
+  return `plugin:${pluginId}`;
+}
+
+export interface PluginRuntime {
+  /** Executable plus arguments, spawned without a shell. */
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+  /** Working directory relative to the plugin folder. Defaults to the plugin folder. */
+  cwd?: string;
+}
+
+export interface PluginProviderMeta {
+  display_name: string;
+  version?: string;
+  capabilities: CapabilityId[];
+  config_fields?: ProviderConfigField[];
+  secret_fields?: string[];
+  service_profiles?: ServiceProfile[];
+}
+
+export interface PluginManifest {
+  manifest_version: 1;
+  id: string;
+  name: string;
+  version: string;
+  protocol: string;
+  description?: string;
+  homepage?: string;
+  runtime: PluginRuntime;
+  permissions: PluginPermission[];
+  provider: PluginProviderMeta;
+}
+
+export type PluginStatus = 'installed' | 'disabled' | 'error';
+
+export interface PluginRecord {
+  id: string;
+  name: string;
+  version: string;
+  protocol_version: string;
+  description: string | null;
+  manifest: PluginManifest;
+  install_path: string;
+  enabled: boolean;
+  trusted: boolean;
+  requested_permissions: PluginPermission[];
+  granted_permissions: PluginPermission[];
+  status: PluginStatus;
+  last_error: string | null;
+  last_handshake_at: string | null;
+  installed_at: string;
+  updated_at: string;
+}
+
+export interface PluginTestResult {
+  success: boolean;
+  protocol_version: string | null;
+  server: { name: string; version: string } | null;
+  capabilities: CapabilityId[];
+  latency_ms: number;
+  diagnostics: string[];
+  tested_at: string;
+}
+
 export type StorageBackendType = 'local' | 's3';
 export const STORAGE_BACKEND_TYPES: StorageBackendType[] = ['local', 's3'];
 

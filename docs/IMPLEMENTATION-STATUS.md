@@ -392,6 +392,79 @@ files and a real local HTTP server; no live third-party API was available here)
 ```
 
 ```
+PHASE: 7 — External plugin SDK & plugin host
+STATUS: completed (verified end-to-end with a real child process and the crash-isolation fixture;
+no OS-level sandbox or package signing)
+
+1. Implemented
+- Manifest (`udmt-plugin.json`) schema and validator: id/version/protocol/runtime/permissions/provider
+  metadata (`display_name`, `capabilities`, `config_fields`). Unknown protocol versions and malformed
+  manifests are refused before anything is installed.
+- Versioned wire protocol `udmt-provider/1`: newline-delimited JSON-RPC 2.0 over stdio with
+  `initialize`, `provider.testConnection`, `discoverResources`, `readSchema`, `readBatch`,
+  `writeBatch`, `provider.cancel` and `shutdown`. Documented in
+  `docs/provider-contract/external-plugin-protocol-v1.md`.
+- Process host (`PluginProcess`): spawns without a shell, per-call timeout, abort-signal cancellation,
+  bounded/redacted diagnostics, and crash isolation (a dead process rejects only its own calls).
+- `ExternalProvider` adapts the protocol to the existing provider contract, so external providers work
+  in connection test, discovery, schema, export, import and sync without touching the engine.
+  `readBatch` is looped into the contract's async generator; `writeRows` is split into `writeBatch`
+  calls.
+- Trust/permission model: plugins install disabled and untrusted, can only be enabled after trust, and
+  grant at most the permissions they requested. Registered as `plugin:<id>` so they can never shadow a
+  built-in provider. See `docs/security/plugin-trust-model.md`.
+- Lifecycle surfaces: install / update / enable / disable / trust / untrust / remove / test, exposed in
+  `UdmtApp`, the CLI (`udmt plugin ...`), REST (`/api/plugins`, `/api/plugins/:id`,
+  `/api/plugins/:id/update`, `/api/plugins/:id/test`) and a GUI Plugins page (list, install by folder,
+  permission-grant modal, enable switch, test, update, guarded remove) with en/vi locales.
+- Developer sample: `plugins/sample-jsonapi/` (in-memory dataset, paginated reads, write echo,
+  required-field validation) plus a deliberate crash fixture under `tests/fixtures/plugins/crash/`.
+
+2. Files changed
+- `src/core/plugins/{manifest,host,provider}.ts` (new), `src/core/types.ts`, `src/core/errors.ts`
+  (`ERROR_CODES`/`isErrorCode`), `src/core/db/{migrations,store}.ts`, `src/core/providers/registry.ts`
+  (register/remove), `src/core/service.ts`, `src/cli/bin.ts`, `src/api/server.ts`,
+  `app/{pages/plugins.vue,layouts/default.vue,types.ts,i18n/locales/*}`,
+  `plugins/sample-jsonapi/*` (new), `tests/fixtures/plugins/crash/*` (new),
+  `tests/integration/plugin-host.test.ts` (new),
+  `docs/provider-contract/external-plugin-protocol-v1.md` (new), `docs/security/plugin-trust-model.md`
+  (new), this file, `docs/database/schema-and-migrations.md`, `docs/testing/provider-contract-tests.md`,
+  `docs/architecture/target-architecture.md`.
+
+3. Database migrations
+- v5 `external-plugins` creates `plugins` (manifest, install path, enabled/trusted, requested/granted
+  permissions, status, last error/handshake). New and additive.
+
+4. Tests executed
+- `pnpm run typecheck` clean; `pnpm test` 83/83 passing; `pnpm run check:i18n` clean; server + GUI build.
+- Integration (7): install-no-exposure, enable-before-trust refusal, unrequested-permission refusal,
+  trust+enable registration with a granted subset, malformed manifest / future protocol rejection,
+  handshake+discover+export(25 rows)+import(25 rows) through the real engine with the secret kept out
+  of diagnostics, crash isolation (plugin dies, built-in SQLite still connects), and remove/unregister.
+
+5. Manual verification
+- The sample plugin is a real Node child process; the integration suite runs it end-to-end through the
+  same `UdmtApp` paths the GUI/CLI use (export produced a verified 25-row artifact, which was imported
+  into SQLite).
+- Crash fixture (`process.exit(3)`) reported `CONNECTION_FAILED` with "stopped unexpectedly"; the
+  subsequent SQLite connection test succeeded, proving the core/GUI path survives a plugin crash.
+
+6. Known limitations / risks
+- No OS-level sandbox: a trusted plugin has the same machine rights as the core. Trust is a user
+  decision; the manifest is declarative and capabilities can be over-claimed.
+- No plugin package/signature verification, registry, or auto-update; install references a local folder.
+- One process per plugin provider, started lazily and shared across connections; a hung call is bounded
+  by the 30 s timeout but a plugin that ignores cancellation can keep running until stopped.
+- `readBatch`/`writeBatch` transfer rows as JSON arrays, so very wide/large batches increase memory and
+  IPC size; the engine's batch size still applies.
+- Deterministic contract-test harness for third-party authors is the protocol doc + sample plugin +
+  the host integration test; there is no separate `udmt plugin test-suite` command yet.
+
+7. Next recommended phase
+- Phase 8 — Incremental sync, CDC and advanced replication.
+```
+
+```
 PHASE: GUI (roadmap section 14, delivered with Phase 1–3)
 STATUS: completed for the implemented features
 

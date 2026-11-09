@@ -9,7 +9,8 @@ src/core            business logic (no UI, no HTTP)
   ├── state-machine.ts  the only legal operation transitions
   ├── service.ts        UdmtApp facade used by CLI, API and worker
   ├── db/               node:sqlite metadata store, versioned migrations, repositories
-  ├── providers/        contract + sqlite / postgresql / mysql / mongodb adapters + registry
+  ├── providers/        contract + sqlite / postgresql / mysql / mongodb / rest adapters + registry
+  ├── plugins/          external provider manifest, process host and provider adapter
   ├── formats/          CSV / JSONL / JSON (streaming) + XML / XLSX writers & readers (+ gzip)
   ├── operation/        unified operation engine (export, import, verify)
   ├── storage/          local artifact backend + manifest/checksum handling
@@ -88,6 +89,6 @@ rewrite:
 
 ## 6. What is intentionally absent
 
-External plugin host, CDC, notifications, OS keyring and native dump tooling. S3 storage and the Data
-Sync engine are implemented (Phases 4–5). Each has a documented state in
+CDC, notifications, OS keyring and native dump tooling. S3 storage, the Data Sync engine and the
+external plugin host are implemented (Phases 4–5, 7). Each has a documented state in
 `docs/IMPLEMENTATION-STATUS.md`; none is mocked or faked.

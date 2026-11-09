@@ -16,7 +16,8 @@
     "operations": "Operations",
     "schedules": "Schedules",
     "system": "System",
-    "docs": "Documentation"
+    "docs": "Documentation",
+    "plugins": "Plugins"
   },
   "common": {
     "loading": "Loading…",
@@ -631,5 +632,46 @@
       "reference": "Reference",
       "other": "Other"
     }
+  },
+  "pluginsPage": {
+    "title": "Plugins",
+    "subtitle": "Install and trust external providers that run in their own process",
+    "installTitle": "Install a plugin",
+    "installHelp": "Point at a folder containing udmt-plugin.json. Plugins start disabled and untrusted.",
+    "installPlaceholder": "D:\\plugins\\my-provider",
+    "install": "Install",
+    "installed": "Plugin installed",
+    "installFailed": "Install failed",
+    "installedTitle": "Installed plugins",
+    "empty": "No plugins installed.",
+    "untrusted": "Untrusted",
+    "requested": "Requested",
+    "granted": "Granted",
+    "enabled": "Enabled",
+    "enabledDone": "Plugin enabled",
+    "disabledDone": "Plugin disabled",
+    "review": "Review permissions",
+    "untrust": "Untrust",
+    "trusted": "Plugin trusted",
+    "revoked": "Trust revoked",
+    "test": "Test",
+    "testOk": "Handshake OK",
+    "testFailed": "Handshake failed",
+    "update": "Update",
+    "updated": "Plugin updated",
+    "removed": "Plugin removed",
+    "actionFailed": "Action failed",
+    "loadFailed": "Could not load plugins",
+    "trustTitle": "Grant permissions",
+    "trustHelp": "The plugin runs with only the permissions you grant. Revoke trust to stop it.",
+    "permReadConfig": "Read connection settings",
+    "permReadSecrets": "Read stored credentials",
+    "permNetwork": "Make network requests",
+    "permFilesystem": "Read and write files",
+    "permWriteData": "Write to target data sources",
+    "noPermissions": "This plugin requested no permissions.",
+    "grantAndTrust": "Grant and trust",
+    "removeTitle": "Remove plugin",
+    "removeHelp": "The plugin is unregistered; its files stay on disk."
   }
 }

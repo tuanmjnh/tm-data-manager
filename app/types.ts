@@ -245,6 +245,55 @@ export interface SyncRunError {
   created_at: string
 }
 
+export type PluginPermission = 'read_config' | 'read_secrets' | 'network' | 'filesystem' | 'write_data'
+
+export interface PluginManifest {
+  manifest_version: 1
+  id: string
+  name: string
+  version: string
+  protocol: string
+  description?: string
+  runtime: { command: string; args?: string[] }
+  permissions: PluginPermission[]
+  provider: {
+    display_name: string
+    version?: string
+    capabilities: string[]
+    config_fields?: ConfigField[]
+    secret_fields?: string[]
+  }
+}
+
+export interface PluginRecord {
+  id: string
+  name: string
+  version: string
+  protocol_version: string
+  description: string | null
+  manifest: PluginManifest
+  install_path: string
+  enabled: boolean
+  trusted: boolean
+  requested_permissions: PluginPermission[]
+  granted_permissions: PluginPermission[]
+  status: 'installed' | 'disabled' | 'error'
+  last_error: string | null
+  last_handshake_at: string | null
+  installed_at: string
+  updated_at: string
+}
+
+export interface PluginTestResult {
+  success: boolean
+  protocol_version: string | null
+  server: { name: string; version: string } | null
+  capabilities: string[]
+  latency_ms: number
+  diagnostics: string[]
+  tested_at: string
+}
+
 export interface LogEntry {
   id: number
   run_id: string

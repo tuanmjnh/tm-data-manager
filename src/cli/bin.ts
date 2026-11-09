@@ -6,7 +6,7 @@ import { UdmtError, toUdmtError } from '../core/errors.js';
 import { APP_VERSION } from '../core/utils.js';
 import { WorkerRuntime } from '../core/worker.js';
 import { startApiServer } from '../api/server.js';
-import type { ExportFormat, ImportRequest, OperationRun, SyncFieldMapping, SyncLoadMode, SyncOptions } from '../core/types.js';
+import type { ExportFormat, ImportRequest, OperationRun, PluginPermission, SyncFieldMapping, SyncLoadMode, SyncOptions } from '../core/types.js';
 import {
   EXIT,
   RESET,
@@ -1113,6 +1113,164 @@ sync
         })),
         ['row', 'batch', 'code', 'message'],
       );
+    });
+  });
+
+// ------------------------------------------------------------------ plugins
+const plugin = program.command('plugin').description('Manage external provider plugins');
+
+plugin
+  .command('list')
+  .description('List installed plugins')
+  .action(async () => {
+    await withApp((app) => {
+      const rows = app.listPlugins();
+      if (globalOptions().json) return printJson(rows);
+      if (rows.length === 0) return process.stdout.write('No plugins installed.\n');
+      printTable(
+        rows.map((row) => ({
+          id: row.id,
+          version: row.version,
+          status: row.status,
+          enabled: row.enabled,
+          trusted: row.trusted,
+          permissions: row.granted_permissions.join(',') || '—',
+          updated: row.updated_at,
+        })),
+        ['id', 'version', 'status', 'enabled', 'trusted', 'permissions', 'updated'],
+      );
+    });
+  });
+
+plugin
+  .command('inspect')
+  .argument('<plugin>')
+  .description('Show a plugin manifest, permissions and status')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const row = app.getPlugin(id);
+      if (globalOptions().json) return printJson(row);
+      process.stdout.write(`${row.name} (${row.id}) v${row.version} — ${row.status}\n`);
+      process.stdout.write(`path:          ${row.install_path}\n`);
+      process.stdout.write(`protocol:      ${row.protocol_version}\n`);
+      process.stdout.write(`enabled:       ${row.enabled ? 'yes' : 'no'}\n`);
+      process.stdout.write(`trusted:       ${row.trusted ? 'yes' : 'no'}\n`);
+      process.stdout.write(`requested:     ${row.requested_permissions.join(', ') || '—'}\n`);
+      process.stdout.write(`granted:       ${row.granted_permissions.join(', ') || '—'}\n`);
+      process.stdout.write(`capabilities:  ${row.manifest.provider.capabilities.join(', ')}\n`);
+      process.stdout.write(`runtime:       ${row.manifest.runtime.command} ${(row.manifest.runtime.args ?? []).join(' ')}\n`);
+      if (row.last_error) process.stdout.write(`last error:    ${row.last_error}\n`);
+    });
+  });
+
+plugin
+  .command('install')
+  .description('Install a plugin from a folder containing udmt-plugin.json')
+  .requiredOption('--path <dir>')
+  .option('--trust', 'grant every requested permission immediately')
+  .option('--enable', 'enable the plugin (requires trust)')
+  .action(async (options: Record<string, unknown>) => {
+    await withApp((app) => {
+      const installed = app.installPlugin({
+        path: String(options.path),
+        trusted: Boolean(options.trust),
+        enabled: Boolean(options.enable),
+      });
+      if (globalOptions().json) return printJson(installed);
+      process.stdout.write(`Installed plugin "${installed.id}" v${installed.version} (trusted: ${installed.trusted}).\n`);
+      if (!installed.trusted) {
+        process.stdout.write(`Review permissions with: udmt plugin inspect ${installed.id}\n`);
+        process.stdout.write(`Grant them with: udmt plugin trust ${installed.id}\n`);
+      }
+    });
+  });
+
+plugin
+  .command('update')
+  .argument('<plugin>')
+  .description('Re-read the manifest from the install folder')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.updatePlugin(id);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Updated plugin "${updated.id}" to v${updated.version}.\n`);
+    });
+  });
+
+plugin
+  .command('trust')
+  .argument('<plugin>')
+  .option('--permissions <list>', 'comma-separated subset of the requested permissions')
+  .description('Grant permissions and mark the plugin trusted')
+  .action(async (id: string, options: Record<string, unknown>) => {
+    await withApp((app) => {
+      const granted = typeof options.permissions === 'string' && options.permissions.trim()
+        ? (options.permissions.split(',').map((entry) => entry.trim()).filter(Boolean) as PluginPermission[])
+        : undefined;
+      const updated = app.setPluginTrust(id, { trusted: true, ...(granted ? { granted_permissions: granted } : {}) });
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Trusted plugin "${updated.id}" with permissions: ${updated.granted_permissions.join(', ') || '—'}\n`);
+    });
+  });
+
+plugin
+  .command('untrust')
+  .argument('<plugin>')
+  .description('Revoke trust and disable the plugin')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.setPluginTrust(id, { trusted: false });
+      app.setPluginEnabled(id, false);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Revoked trust for plugin "${id}".\n`);
+    });
+  });
+
+plugin
+  .command('enable')
+  .argument('<plugin>')
+  .description('Enable a trusted plugin')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.setPluginEnabled(id, true);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Enabled plugin "${updated.id}".\n`);
+    });
+  });
+
+plugin
+  .command('disable')
+  .argument('<plugin>')
+  .description('Disable a plugin')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      const updated = app.setPluginEnabled(id, false);
+      if (globalOptions().json) return printJson(updated);
+      process.stdout.write(`Disabled plugin "${updated.id}".\n`);
+    });
+  });
+
+plugin
+  .command('remove')
+  .argument('<plugin>')
+  .description('Remove a plugin (files are left on disk)')
+  .action(async (id: string) => {
+    await withApp((app) => {
+      app.removePlugin(id);
+      process.stdout.write(`Removed plugin "${id}".\n`);
+    });
+  });
+
+plugin
+  .command('test')
+  .argument('<plugin>')
+  .description('Handshake the plugin and report protocol, version and capabilities')
+  .action(async (id: string) => {
+    await withApp(async (app) => {
+      const result = await app.testPlugin(id);
+      if (globalOptions().json) return printJson(result);
+      process.stdout.write(`${result.success ? 'OK' : 'FAILED'} ${id} (${result.latency_ms}ms)\n`);
+      for (const line of result.diagnostics) process.stdout.write(`  - ${line}\n`);
     });
   });
 

@@ -31,6 +31,34 @@ export type ErrorCode =
   | 'INTERRUPTED'
   | 'INTERNAL_ERROR';
 
+export const ERROR_CODES: ErrorCode[] = [
+  'INVALID_INPUT',
+  'INVALID_CONFIG',
+  'VALIDATION_FAILED',
+  'NOT_FOUND',
+  'ALREADY_EXISTS',
+  'CONNECTION_FAILED',
+  'AUTH_FAILED',
+  'CAPABILITY_UNSUPPORTED',
+  'PRECONDITION_FAILED',
+  'CONFIRMATION_REQUIRED',
+  'CONFLICT',
+  'LOCKED',
+  'PATH_UNSAFE',
+  'IO_ERROR',
+  'STORAGE_ERROR',
+  'FORMAT_UNSUPPORTED',
+  'SYNC_ROW_ERROR',
+  'OPERATION_FAILED',
+  'OPERATION_CANCELLED',
+  'INTERRUPTED',
+  'INTERNAL_ERROR',
+];
+
+export function isErrorCode(value: unknown): value is ErrorCode {
+  return typeof value === 'string' && (ERROR_CODES as string[]).includes(value);
+}
+
 export class UdmtError extends Error {
   readonly code: ErrorCode;
   readonly retryable: boolean;

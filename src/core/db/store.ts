@@ -11,6 +11,7 @@ import type {
   OperationRun,
   OperationStatus,
   RunProgress,
+  PluginRecord,
   ScheduleRecord,
   StorageBackendRecord,
   SyncPipelineRecord,
@@ -341,6 +342,126 @@ export class Store {
       nowIso(),
       id,
     );
+  }
+
+  // ---------------------------------------------------------------- plugins
+  listPlugins(): PluginRecord[] {
+    return this.db
+      .all<Record<string, unknown>>('SELECT * FROM plugins ORDER BY name COLLATE NOCASE')
+      .map(mapPlugin);
+  }
+
+  getPlugin(id: string): PluginRecord | undefined {
+    const row = this.db.get<Record<string, unknown>>('SELECT * FROM plugins WHERE id = ?', id);
+    return row ? mapPlugin(row) : undefined;
+  }
+
+  requirePlugin(id: string): PluginRecord {
+    const found = this.getPlugin(id);
+    if (!found) throw new UdmtError('NOT_FOUND', `Plugin not found: ${id}`);
+    return found;
+  }
+
+  createPlugin(record: {
+    id: string;
+    name: string;
+    version: string;
+    protocol_version: string;
+    description: string | null;
+    manifest: PluginRecord['manifest'];
+    install_path: string;
+    enabled: boolean;
+    trusted: boolean;
+    requested_permissions: PluginRecord['requested_permissions'];
+    granted_permissions: PluginRecord['granted_permissions'];
+    status: PluginRecord['status'];
+  }): PluginRecord {
+    const now = nowIso();
+    this.db.run(
+      `INSERT INTO plugins (
+         id, name, version, protocol_version, description, manifest_json, install_path,
+         enabled, trusted, requested_permissions_json, granted_permissions_json, status,
+         last_error, last_handshake_at, installed_at, updated_at
+       ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
+      record.id,
+      record.name,
+      record.version,
+      record.protocol_version,
+      record.description,
+      JSON.stringify(record.manifest),
+      record.install_path,
+      record.enabled ? 1 : 0,
+      record.trusted ? 1 : 0,
+      JSON.stringify(record.requested_permissions),
+      JSON.stringify(record.granted_permissions),
+      record.status,
+      now,
+      now,
+    );
+    return this.requirePlugin(record.id);
+  }
+
+  updatePlugin(
+    id: string,
+    patch: {
+      name?: string;
+      version?: string;
+      protocol_version?: string;
+      description?: string | null;
+      manifest?: PluginRecord['manifest'];
+      install_path?: string;
+      enabled?: boolean;
+      trusted?: boolean;
+      requested_permissions?: PluginRecord['requested_permissions'];
+      granted_permissions?: PluginRecord['granted_permissions'];
+      status?: PluginRecord['status'];
+      last_error?: string | null;
+      last_handshake_at?: string | null;
+    },
+  ): PluginRecord {
+    const existing = this.requirePlugin(id);
+    const next = {
+      name: patch.name ?? existing.name,
+      version: patch.version ?? existing.version,
+      protocol_version: patch.protocol_version ?? existing.protocol_version,
+      description: patch.description === undefined ? existing.description : patch.description,
+      manifest: patch.manifest ?? existing.manifest,
+      install_path: patch.install_path ?? existing.install_path,
+      enabled: patch.enabled ?? existing.enabled,
+      trusted: patch.trusted ?? existing.trusted,
+      requested_permissions: patch.requested_permissions ?? existing.requested_permissions,
+      granted_permissions: patch.granted_permissions ?? existing.granted_permissions,
+      status: patch.status ?? existing.status,
+      last_error: patch.last_error === undefined ? existing.last_error : patch.last_error,
+      last_handshake_at: patch.last_handshake_at === undefined ? existing.last_handshake_at : patch.last_handshake_at,
+    };
+    this.db.run(
+      `UPDATE plugins SET
+         name = ?, version = ?, protocol_version = ?, description = ?, manifest_json = ?,
+         install_path = ?, enabled = ?, trusted = ?, requested_permissions_json = ?,
+         granted_permissions_json = ?, status = ?, last_error = ?, last_handshake_at = ?, updated_at = ?
+       WHERE id = ?`,
+      next.name,
+      next.version,
+      next.protocol_version,
+      next.description,
+      JSON.stringify(next.manifest),
+      next.install_path,
+      next.enabled ? 1 : 0,
+      next.trusted ? 1 : 0,
+      JSON.stringify(next.requested_permissions),
+      JSON.stringify(next.granted_permissions),
+      next.status,
+      next.last_error,
+      next.last_handshake_at,
+      nowIso(),
+      id,
+    );
+    return this.requirePlugin(id);
+  }
+
+  deletePlugin(id: string): void {
+    this.db.run('DELETE FROM plugins WHERE id = ?', id);
   }
 
   // ---------------------------------------------------------------- sync
@@ -1158,6 +1279,28 @@ function mapStorage(row: Record<string, unknown>): StorageBackendRecord {
     last_tested_at: (row.last_tested_at as string | null) ?? null,
     last_test_status: (row.last_test_status as 'success' | 'failed' | null) ?? null,
     created_at: String(row.created_at),
+    updated_at: String(row.updated_at),
+  };
+}
+
+function mapPlugin(row: Record<string, unknown>): PluginRecord {
+  const manifest = json<PluginRecord['manifest']>(row.manifest_json as string, {} as PluginRecord['manifest']);
+  return {
+    id: String(row.id),
+    name: String(row.name),
+    version: String(row.version),
+    protocol_version: String(row.protocol_version),
+    description: (row.description as string | null) ?? null,
+    manifest,
+    install_path: String(row.install_path),
+    enabled: Boolean(row.enabled),
+    trusted: Boolean(row.trusted),
+    requested_permissions: json<PluginRecord['requested_permissions']>(row.requested_permissions_json as string, []),
+    granted_permissions: json<PluginRecord['granted_permissions']>(row.granted_permissions_json as string, []),
+    status: String(row.status) as PluginRecord['status'],
+    last_error: (row.last_error as string | null) ?? null,
+    last_handshake_at: (row.last_handshake_at as string | null) ?? null,
+    installed_at: String(row.installed_at),
     updated_at: String(row.updated_at),
   };
 }

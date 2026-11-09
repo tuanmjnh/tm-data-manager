@@ -1,7 +1,8 @@
 # Testing strategy
 
-Run with `pnpm test` (vitest). Current suite: **76 tests**, ~15 s, no external services required (the
-REST and S3 integration tests start their own local HTTP servers).
+Run with `pnpm test` (vitest). Current suite: **83 tests**, ~18 s, no external services required (the
+REST and S3 integration tests start their own local HTTP servers; the plugin tests spawn local child
+processes).
 
 ## Unit
 
@@ -42,6 +43,10 @@ list, download, delete, export→S3→catalog→import round trip, delete protec
 `tests/integration/rest-connector.test.ts` — a local JSON HTTP API: config secrecy, authenticated
 paginated connection test, 401 without leaking the secret, API key in a header, missing-credential
 rejection, and REST → artifact → SQLite import over multiple pages.
+
+`tests/integration/plugin-host.test.ts` — installs `plugins/sample-jsonapi`, checks trust gating and
+permission subsets, rejects bad/future manifests, runs handshake + discovery + export + import through
+the real engine, proves crash isolation with `tests/fixtures/plugins/crash`, and checks remove/unregister.
 
 `tests/integration/migrations.test.ts` — fresh DB is versioned and idempotent; a legacy
 `connections`/`operation_logs` schema is migrated without losing rows, mapped to

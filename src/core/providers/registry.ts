@@ -28,6 +28,20 @@ export class ProviderRegistry {
     return [...this.providers.values()].map((provider) => provider.descriptor());
   }
 
+  /** Registers an external (plugin) provider; built-in ids are never overwritten. */
+  register(provider: DataProvider): void {
+    if (this.providers.has(provider.providerId)) {
+      throw new UdmtError('ALREADY_EXISTS', `Provider "${provider.providerId}" is already registered.`, {
+        details: { provider_id: provider.providerId },
+      });
+    }
+    this.providers.set(provider.providerId, provider);
+  }
+
+  remove(providerId: string): boolean {
+    return this.providers.delete(providerId);
+  }
+
   get(providerId: string): DataProvider {
     const provider = this.providers.get(providerId);
     if (!provider) {
