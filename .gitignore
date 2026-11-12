@@ -5,5 +5,9 @@ dist/
 data/
 artifacts/
 *.log
+.playwright-mcp
+.tmp-*
+.gate-*
+scratch
 src-tauri/runtime/
 src-tauri/target/
